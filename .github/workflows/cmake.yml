@@ -15,9 +15,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Install dependencies
-      shell: bash
-      run: apt install -y gperf 
+    - name: Install Build Dependencies
+      run: sudo apt install -y gperf 
       
     - uses: actions/checkout@v2
       with:
