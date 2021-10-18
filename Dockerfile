@@ -1,3 +1,4 @@
+ARG github.workspace
 FROM gcc:bullseye AS build
 
 RUN apt update && apt -y install zlib1g-dev libssl-dev cmake gperf ccache
