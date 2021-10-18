@@ -27,10 +27,10 @@ jobs:
       # We'll use this as our working directory for all subsequent commands
       run: cmake -E make_directory ${{github.workspace}}/build
       
-    - uses: actions/cache@v2.1.5
+    - uses: actions/cache@v2.1.6
       id: cache
       with:
-        path: ${{github.workspace}}/build
+        path: ${{github.workspace}}/.ccache
         key: ${{ runner.os }}-cmake-${{ hashFiles('CMakeLists.txt') }}
         restore-keys: |
           ${{ runner.os }}-cmake-${{ hashFiles('CMakeLists.txt') }}
@@ -63,24 +63,20 @@ jobs:
      runs-on: ubuntu-latest
      
      steps:
+     - name: Set up Cache
+       uses: actions/cache@v2.1.6
+       id: cache
+       with:
+          path: ${{github.workspace}}/.ccache
+          key: ${{ runner.os }}-cmake-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-cmake-${{ hashFiles('CMakeLists.txt') }}
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v1
         
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
-        
-      - name: Download a Build Artifact
-        uses: actions/download-artifact@v2.0.9
-        with:
-          name: telegram-bot-api
-          path: ${{github.workspace}}/docker/telegram-bot-api
-          
-      - name: Create Dockerfile
-        run: |
-          cat << EOF >> Dockerfile
-          FROM alpine:latest
-          WORKDIR /app
-          COPY ./telegram-bot-api /app/telegram-bot-api
           
       - name: Build and Push
         id: docker_build
