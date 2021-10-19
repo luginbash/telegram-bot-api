@@ -4,12 +4,10 @@ FROM gcc:bullseye AS build
 RUN apt update && apt -y install zlib1g-dev libssl-dev cmake gperf ccache
 
 COPY . /src/telegram-bot-api
-ADD .ccache /build_cache
-ENV CCACHE_DIR=/build_cache
 WORKDIR /src/telegram-bot-api
 
 RUN mkdir build && cd build \
-    && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    && cmake .. -DCMAKE_BUILD_TYPE=Release \
     && cmake --build . --config Release --target install/strip
 #    && strip -s /src/telegram-bot-api/build/telegram-bot-api
 
