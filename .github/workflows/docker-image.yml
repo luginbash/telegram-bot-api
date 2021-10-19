@@ -7,7 +7,7 @@ env:
   BUILD_TYPE: Release
 
 jobs:
-  build:
+  cmake-build-and-cache:
     # The CMake configure and build commands are platform agnostic and should work equally
     # well on Windows or Mac.  You can convert this to a matrix build if you need
     # cross-platform coverage.
@@ -54,7 +54,7 @@ jobs:
       env:
         CCACHE_DIR: ${{github.workspace}}/.ccache
       # Execute the build.  You can specify a specific target with "--target <NAME>"
-      run: cmake --build . --config $BUILD_TYPE -D CMAKE_C_COMPILER_LAUNCHER=ccache -D CMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --build . --config $BUILD_TYPE
       
     - name: Upload a Build Artifact  
       uses: actions/upload-artifact@v2.2.3
@@ -62,7 +62,7 @@ jobs:
         name: telegram-bot-api
         path: ${{github.workspace}}/build/telegram-bot-api
       
-  docker:
+  docker-build-and-push:
      needs: build
      runs-on: ubuntu-latest
      
