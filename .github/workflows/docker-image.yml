@@ -7,14 +7,6 @@ jobs:
      runs-on: ubuntu-latest
      
      steps:
-      - uses: actions/cache@v2.1.6
-        id: cache
-        with:
-         path: ${{github.workspace}}/.ccache
-         key: ${{ runner.os }}-cmake-${{ hashFiles('CMakeLists.txt') }}
-         restore-keys: |
-           ${{ runner.os }}-cmake-${{ hashFiles('CMakeLists.txt') }}
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v1
 
@@ -27,6 +19,9 @@ jobs:
         with:
           push: true
           tags: ghcr.io/${{github.actor}}/${{github.repository}}:latest
+          secrets: |
+            GIT_AUTH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
