@@ -20,7 +20,7 @@ jobs:
           push: true
           tags: ghcr.io/${{github.actor}}/${{github.repository}}:latest
           secrets: |
-            GIT_AUTH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
             
 
       - name: Image digest
