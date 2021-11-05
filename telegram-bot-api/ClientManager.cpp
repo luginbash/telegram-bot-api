@@ -112,13 +112,17 @@ void ClientManager::send(PromisedQueryPtr query) {
       }
       flood_control.add_event(static_cast<td::int32>(now));
     }
+    auto tqueue_id = get_tqueue_id(r_user_id.ok(), query->is_test_dc());
+    if (active_client_count_.find(tqueue_id) != active_client_count_.end()) {
+      // return query->set_retry_after_error(1);
+    }
 
-    auto id = clients_.create(ClientInfo{BotStatActor(stat_.actor_id(&stat_)), token, td::ActorOwn<Client>()});
+    auto id =
+        clients_.create(ClientInfo{BotStatActor(stat_.actor_id(&stat_)), token, tqueue_id, td::ActorOwn<Client>()});
     auto *client_info = clients_.get(id);
-    client_info->client_ =
-        td::create_actor<Client>(PSLICE() << "Client/" << token, actor_shared(this, id), query->token().str(),
-                                 query->is_test_dc(), get_tqueue_id(r_user_id.ok(), query->is_test_dc()), parameters_,
-                                 client_info->stat_.actor_id(&client_info->stat_));
+    client_info->client_ = td::create_actor<Client>(PSLICE() << "Client/" << token, actor_shared(this, id),
+                                                    query->token().str(), query->is_test_dc(), tqueue_id, parameters_,
+                                                    client_info->stat_.actor_id(&client_info->stat_));
 
     auto method = query->method();
     if (method != "deletewebhook" && method != "setwebhook") {
@@ -196,18 +200,18 @@ void ClientManager::get_stats(td::PromiseActor<td::BufferSlice> promise,
     top_bot_ids.emplace(static_cast<td::int64>(score * 1e9), id);
   }
 
-  sb << stat_.get_description() << "\n";
+  sb << stat_.get_description() << '\n';
   if (id_filter.empty()) {
-    sb << "uptime\t" << now - parameters_->start_time_ << "\n";
-    sb << "bot_count\t" << clients_.size() << "\n";
-    sb << "active_bot_count\t" << active_bot_count << "\n";
+    sb << "uptime\t" << now - parameters_->start_time_ << '\n';
+    sb << "bot_count\t" << clients_.size() << '\n';
+    sb << "active_bot_count\t" << active_bot_count << '\n';
     auto r_mem_stat = td::mem_stat();
     if (r_mem_stat.is_ok()) {
       auto mem_stat = r_mem_stat.move_as_ok();
-      sb << "rss\t" << td::format::as_size(mem_stat.resident_size_) << "\n";
-      sb << "vm\t" << td::format::as_size(mem_stat.virtual_size_) << "\n";
-      sb << "rss_peak\t" << td::format::as_size(mem_stat.resident_size_peak_) << "\n";
-      sb << "vm_peak\t" << td::format::as_size(mem_stat.virtual_size_peak_) << "\n";
+      sb << "rss\t" << td::format::as_size(mem_stat.resident_size_) << '\n';
+      sb << "vm\t" << td::format::as_size(mem_stat.virtual_size_) << '\n';
+      sb << "rss_peak\t" << td::format::as_size(mem_stat.resident_size_peak_) << '\n';
+      sb << "vm_peak\t" << td::format::as_size(mem_stat.virtual_size_peak_) << '\n';
     } else {
       LOG(INFO) << "Failed to get memory statistics: " << r_mem_stat.error();
     }
@@ -215,16 +219,16 @@ void ClientManager::get_stats(td::PromiseActor<td::BufferSlice> promise,
     ServerCpuStat::update(td::Time::now());
     auto cpu_stats = ServerCpuStat::instance().as_vector(td::Time::now());
     for (auto &stat : cpu_stats) {
-      sb << stat.key_ << "\t" << stat.value_ << "\n";
+      sb << stat.key_ << "\t" << stat.value_ << '\n';
     }
 
-    sb << "buffer_memory\t" << td::format::as_size(td::BufferAllocator::get_buffer_mem()) << "\n";
-    sb << "active_webhook_connections\t" << WebhookActor::get_total_connections_count() << "\n";
-    sb << "active_requests\t" << parameters_->shared_data_->query_count_.load() << "\n";
-    sb << "active_network_queries\t" << td::get_pending_network_query_count(*parameters_->net_query_stats_) << "\n";
+    sb << "buffer_memory\t" << td::format::as_size(td::BufferAllocator::get_buffer_mem()) << '\n';
+    sb << "active_webhook_connections\t" << WebhookActor::get_total_connections_count() << '\n';
+    sb << "active_requests\t" << parameters_->shared_data_->query_count_.load() << '\n';
+    sb << "active_network_queries\t" << td::get_pending_network_query_count(*parameters_->net_query_stats_) << '\n';
     auto stats = stat_.as_vector(now);
     for (auto &stat : stats) {
-      sb << stat.key_ << "\t" << stat.value_ << "\n";
+      sb << stat.key_ << "\t" << stat.value_ << '\n';
     }
   }
 
@@ -233,22 +237,23 @@ void ClientManager::get_stats(td::PromiseActor<td::BufferSlice> promise,
     CHECK(client_info);
 
     auto bot_info = client_info->client_->get_actor_unsafe()->get_bot_info();
-    sb << "\n";
-    sb << "id\t" << bot_info.id_ << "\n";
-    sb << "uptime\t" << now - bot_info.start_time_ << "\n";
-    sb << "token\t" << bot_info.token_ << "\n";
-    sb << "username\t" << bot_info.username_ << "\n";
-    sb << "webhook\t" << bot_info.webhook_ << "\n";
-    sb << "has_custom_certificate\t" << bot_info.has_webhook_certificate_ << "\n";
-    sb << "head_update_id\t" << bot_info.head_update_id_ << "\n";
-    sb << "tail_update_id\t" << bot_info.tail_update_id_ << "\n";
-    sb << "pending_update_count\t" << bot_info.pending_update_count_ << "\n";
-    sb << "webhook_max_connections\t" << bot_info.webhook_max_connections_ << "\n";
+    sb << '\n';
+    sb << "id\t" << bot_info.id_ << '\n';
+    sb << "uptime\t" << now - bot_info.start_time_ << '\n';
+    sb << "token\t" << bot_info.token_ << '\n';
+    sb << "username\t" << bot_info.username_ << '\n';
+    sb << "is_active\t" << client_info->stat_.is_active(now) << '\n';
+    sb << "webhook\t" << bot_info.webhook_ << '\n';
+    sb << "has_custom_certificate\t" << bot_info.has_webhook_certificate_ << '\n';
+    sb << "head_update_id\t" << bot_info.head_update_id_ << '\n';
+    sb << "tail_update_id\t" << bot_info.tail_update_id_ << '\n';
+    sb << "pending_update_count\t" << bot_info.pending_update_count_ << '\n';
+    sb << "webhook_max_connections\t" << bot_info.webhook_max_connections_ << '\n';
 
     auto stats = client_info->stat_.as_vector(now);
     for (auto &stat : stats) {
       if (stat.key_ == "update_count" || stat.key_ == "request_count") {
-        sb << stat.key_ << "/sec\t" << stat.value_ << "\n";
+        sb << stat.key_ << "/sec\t" << stat.value_ << '\n';
       }
     }
 
@@ -382,6 +387,21 @@ PromisedQueryPtr ClientManager::get_webhook_restore_query(td::Slice token, td::S
   return PromisedQueryPtr(query.release(), PromiseDeleter(td::PromiseActor<td::unique_ptr<Query>>()));
 }
 
+void ClientManager::raw_event(const td::Event::Raw &event) {
+  auto id = get_link_token();
+  auto *info = clients_.get(id);
+  CHECK(info != nullptr);
+  auto &value = active_client_count_[info->tqueue_id_];
+  if (event.ptr != nullptr) {
+    value++;
+  } else {
+    CHECK(value > 0);
+    if (--value == 0) {
+      active_client_count_.erase(info->tqueue_id_);
+    }
+  }
+}
+
 void ClientManager::hangup_shared() {
   auto id = get_link_token();
   auto *info = clients_.get(id);
@@ -391,18 +411,22 @@ void ClientManager::hangup_shared() {
   clients_.erase(id);
 
   if (close_flag_ && clients_.empty()) {
+    CHECK(active_client_count_.empty());
     close_db();
   }
 }
 
 void ClientManager::close_db() {
   LOG(WARNING) << "Closing databases";
-  td::MultiPromiseActorSafe mpromise("close binlogs");
-  mpromise.add_promise(td::PromiseCreator::lambda(
+  td::MultiPromiseActorSafe mpas("close binlogs");
+  mpas.add_promise(td::PromiseCreator::lambda(
       [actor_id = actor_id(this)](td::Unit) { send_closure(actor_id, &ClientManager::finish_close); }));
+  mpas.set_ignore_errors(true);
 
-  parameters_->shared_data_->tqueue_->close(mpromise.get_promise());
-  parameters_->shared_data_->webhook_db_->close(mpromise.get_promise());
+  auto lock = mpas.get_promise();
+  parameters_->shared_data_->tqueue_->close(mpas.get_promise());
+  parameters_->shared_data_->webhook_db_->close(mpas.get_promise());
+  lock.set_value(td::Unit());
 }
 
 void ClientManager::finish_close() {
