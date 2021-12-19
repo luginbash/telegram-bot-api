@@ -15,7 +15,6 @@
 #include "td/actor/actor.h"
 #include "td/actor/PromiseFuture.h"
 #include "td/actor/SignalSlot.h"
-#include "td/actor/Timeout.h"
 
 #include "td/utils/common.h"
 #include "td/utils/Container.h"
@@ -64,8 +63,6 @@ class Client : public WebhookActor::Callback {
   static constexpr int32 MAX_DOWNLOAD_FILE_SIZE = 20 << 20;
 
   static constexpr int32 MAX_CONCURRENTLY_SENT_CHAT_MESSAGES = 1000;  // some unreasonably big value
-
-  static constexpr int32 MESSAGES_CACHE_TIME = 3600;
 
   static constexpr std::size_t MIN_PENDING_UPDATES_WARNING = 200;
 
@@ -225,6 +222,8 @@ class Client : public WebhookActor::Callback {
   template <class OnSuccess>
   class TdOnCheckChatCallback;
   template <class OnSuccess>
+  class TdOnCheckChatNoFailCallback;
+  template <class OnSuccess>
   class TdOnCheckMessageCallback;
   template <class OnSuccess>
   class TdOnCheckRemoteFileIdCallback;
@@ -251,6 +250,9 @@ class Client : public WebhookActor::Callback {
 
   template <class OnSuccess>
   void check_chat(Slice chat_id_str, AccessRights access_rights, PromisedQueryPtr query, OnSuccess on_success);
+
+  template <class OnSuccess>
+  void check_chat_no_fail(Slice chat_id_str, PromisedQueryPtr query, OnSuccess on_success);
 
   template <class OnSuccess>
   void check_bot_command_scope(BotCommandScope &&scope, PromisedQueryPtr query, OnSuccess on_success);
@@ -497,6 +499,8 @@ class Client : public WebhookActor::Callback {
   Status process_ban_chat_member_query(PromisedQueryPtr &query);
   Status process_restrict_chat_member_query(PromisedQueryPtr &query);
   Status process_unban_chat_member_query(PromisedQueryPtr &query);
+  Status process_ban_chat_sender_chat_query(PromisedQueryPtr &query);
+  Status process_unban_chat_sender_chat_query(PromisedQueryPtr &query);
   Status process_approve_chat_join_request_query(PromisedQueryPtr &query);
   Status process_decline_chat_join_request_query(PromisedQueryPtr &query);
   Status process_get_sticker_set_query(PromisedQueryPtr &query);
@@ -580,9 +584,11 @@ class Client : public WebhookActor::Callback {
     bool can_join_groups = false;
     bool can_read_all_group_messages = false;
     bool is_inline_bot = false;
+    bool has_private_forwards = false;
   };
   static void add_user(std::unordered_map<int64, UserInfo> &users, object_ptr<td_api::user> &&user);
   void set_user_bio(int64 user_id, td::string &&bio);
+  void set_user_has_private_forwards(int64 user_id, bool has_private_forwards);
   const UserInfo *get_user_info(int64 user_id) const;
 
   struct GroupInfo {
@@ -629,6 +635,7 @@ class Client : public WebhookActor::Callback {
     Type type = Type::Unknown;
     td::string title;
     int32 message_auto_delete_time = 0;
+    bool has_protected_content = false;
     object_ptr<td_api::chatPhotoInfo> photo;
     object_ptr<td_api::chatPermissions> permissions;
     union {
@@ -647,10 +654,6 @@ class Client : public WebhookActor::Callback {
   td::string get_chat_description(int64 chat_id) const;
 
   struct MessageInfo {
-    mutable double access_time = 1e20;
-    mutable const MessageInfo *lru_next = nullptr;
-    mutable const MessageInfo *lru_prev = nullptr;
-
     int64 id = 0;
     int64 sender_user_id = 0;
     int64 sender_chat_id = 0;
@@ -671,6 +674,8 @@ class Client : public WebhookActor::Callback {
     object_ptr<td_api::MessageContent> content;
     object_ptr<td_api::ReplyMarkup> reply_markup;
 
+    bool can_be_saved = false;
+    bool is_automatic_forward = false;
     mutable bool is_reply_to_message_deleted = false;
     mutable bool is_content_changed = false;
   };
@@ -710,9 +715,6 @@ class Client : public WebhookActor::Callback {
 
   void remove_replies_to_message(int64 chat_id, int64 reply_to_message_id, bool only_from_cache);
   void delete_message(int64 chat_id, int64 message_id, bool only_from_cache);
-  static void delete_messages_lru(void *client_void);
-  void schedule_next_delete_messages_lru();
-  void update_message_lru(const MessageInfo *message_info) const;
 
   void add_new_message(object_ptr<td_api::message> &&message, bool is_edited);
   void process_new_message_queue(int64 chat_id);
@@ -854,11 +856,11 @@ class Client : public WebhookActor::Callback {
   int32 authorization_date_ = -1;
 
   int64 group_anonymous_bot_user_id_ = 0;
+  int64 channel_bot_user_id_ = 0;
   int64 service_notifications_user_id_ = 0;
 
   static std::unordered_map<td::string, Status (Client::*)(PromisedQueryPtr &query)> methods_;
 
-  MessageInfo messages_lru_root_;
   std::unordered_map<FullMessageId, std::unique_ptr<MessageInfo>, FullMessageIdHash> messages_;  // message cache
   std::unordered_map<int64, UserInfo> users_;                                                    // user info cache
   std::unordered_map<int64, GroupInfo> groups_;                                                  // group info cache
@@ -869,8 +871,6 @@ class Client : public WebhookActor::Callback {
       reply_message_ids_;  // message -> replies to it
   std::unordered_map<FullMessageId, std::unordered_set<int64>, FullMessageIdHash>
       yet_unsent_reply_message_ids_;  // message -> replies to it
-
-  td::Timeout next_delete_messages_lru_timeout_;
 
   std::unordered_map<int32, td::vector<PromisedQueryPtr>> file_download_listeners_;
   std::unordered_set<int32> download_started_file_ids_;

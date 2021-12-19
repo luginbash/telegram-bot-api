@@ -184,9 +184,6 @@ Client::Client(td::ActorShared<> parent, const td::string &bot_token, bool is_te
     , tqueue_id_(tqueue_id)
     , parameters_(std::move(parameters))
     , stat_actor_(std::move(stat_actor)) {
-  messages_lru_root_.lru_next = &messages_lru_root_;
-  messages_lru_root_.lru_prev = &messages_lru_root_;
-
   static auto is_inited = init_methods();
   CHECK(is_inited);
 }
@@ -257,6 +254,8 @@ bool Client::init_methods() {
   methods_.emplace("kickchatmember", &Client::process_ban_chat_member_query);
   methods_.emplace("restrictchatmember", &Client::process_restrict_chat_member_query);
   methods_.emplace("unbanchatmember", &Client::process_unban_chat_member_query);
+  methods_.emplace("banchatsenderchat", &Client::process_ban_chat_sender_chat_query);
+  methods_.emplace("unbanchatsenderchat", &Client::process_unban_chat_sender_chat_query);
   methods_.emplace("approvechatjoinrequest", &Client::process_approve_chat_join_request_query);
   methods_.emplace("declinechatjoinrequest", &Client::process_decline_chat_join_request_query);
   methods_.emplace("getstickerset", &Client::process_get_sticker_set_query);
@@ -634,6 +633,9 @@ class Client::JsonChat : public Jsonable {
           if (!user_info->bio.empty()) {
             object("bio", user_info->bio);
           }
+          if (user_info->has_private_forwards) {
+            object("has_private_forwards", td::JsonTrue());
+          }
         }
         break;
       }
@@ -728,6 +730,9 @@ class Client::JsonChat : public Jsonable {
       if (chat_info->message_auto_delete_time != 0) {
         object("message_auto_delete_time", chat_info->message_auto_delete_time);
       }
+      if (chat_info->has_protected_content) {
+        object("has_protected_content", td::JsonTrue());
+      }
     }
   }
 
@@ -740,18 +745,19 @@ class Client::JsonChat : public Jsonable {
 
 class Client::JsonMessageSender : public Jsonable {
  public:
-  JsonMessageSender(const td_api::MessageSender *sender, const Client *client) : sender_(sender), client_(client) {
+  JsonMessageSender(const td_api::MessageSender *sender_id, const Client *client)
+      : sender_id_(sender_id), client_(client) {
   }
   void store(JsonValueScope *scope) const {
-    CHECK(sender_ != nullptr);
-    switch (sender_->get_id()) {
+    CHECK(sender_id_ != nullptr);
+    switch (sender_id_->get_id()) {
       case td_api::messageSenderUser::ID: {
-        auto sender_user_id = static_cast<const td_api::messageSenderUser *>(sender_)->user_id_;
+        auto sender_user_id = static_cast<const td_api::messageSenderUser *>(sender_id_)->user_id_;
         JsonUser(sender_user_id, client_).store(scope);
         break;
       }
       case td_api::messageSenderChat::ID: {
-        auto sender_chat_id = static_cast<const td_api::messageSenderChat *>(sender_)->chat_id_;
+        auto sender_chat_id = static_cast<const td_api::messageSenderChat *>(sender_id_)->chat_id_;
         JsonChat(sender_chat_id, false, client_).store(scope);
         break;
       }
@@ -761,7 +767,7 @@ class Client::JsonMessageSender : public Jsonable {
   }
 
  private:
-  const td_api::MessageSender *sender_;
+  const td_api::MessageSender *sender_id_;
   const Client *client_;
 };
 
@@ -1420,8 +1426,8 @@ class Client::JsonProximityAlertTriggered : public Jsonable {
   }
   void store(JsonValueScope *scope) const {
     auto object = scope->enter_object();
-    object("traveler", JsonMessageSender(proximity_alert_triggered_->traveler_.get(), client_));
-    object("watcher", JsonMessageSender(proximity_alert_triggered_->watcher_.get(), client_));
+    object("traveler", JsonMessageSender(proximity_alert_triggered_->traveler_id_.get(), client_));
+    object("watcher", JsonMessageSender(proximity_alert_triggered_->watcher_id_.get(), client_));
     object("distance", proximity_alert_triggered_->distance_);
   }
 
@@ -1544,6 +1550,11 @@ class Client::JsonInlineKeyboardButton : public Jsonable {
       case td_api::inlineKeyboardButtonTypeBuy::ID:
         object("pay", td::JsonTrue());
         break;
+      case td_api::inlineKeyboardButtonTypeUser::ID: {
+        auto type = static_cast<const td_api::inlineKeyboardButtonTypeUser *>(button_->type_.get());
+        object("url", PSLICE() << "tg://user?id=" << type->user_id_);
+        break;
+      }
       default:
         UNREACHABLE();
         break;
@@ -1621,6 +1632,9 @@ void Client::JsonMessage::store(JsonValueScope *scope) const {
     }
     if (!message_->initial_sender_name.empty()) {
       object("forward_sender_name", message_->initial_sender_name);
+    }
+    if (message_->is_automatic_forward) {
+      object("is_automatic_forward", td::JsonTrue());
     }
     object("forward_date", message_->initial_send_date);
   }
@@ -1913,6 +1927,9 @@ void Client::JsonMessage::store(JsonValueScope *scope) const {
   }
   if (message_->via_bot_user_id > 0) {
     object("via_bot", JsonUser(message_->via_bot_user_id, client_));
+  }
+  if (!message_->can_be_saved) {
+    object("has_protected_content", td::JsonTrue());
   }
 }
 
@@ -2807,6 +2824,23 @@ class Client::TdOnCheckChatCallback : public TdQueryCallback {
 };
 
 template <class OnSuccess>
+class Client::TdOnCheckChatNoFailCallback : public TdQueryCallback {
+ public:
+  TdOnCheckChatNoFailCallback(int64 chat_id, PromisedQueryPtr query, OnSuccess on_success)
+      : chat_id_(chat_id), query_(std::move(query)), on_success_(std::move(on_success)) {
+  }
+
+  void on_result(object_ptr<td_api::Object> result) override {
+    on_success_(chat_id_, std::move(query_));
+  }
+
+ private:
+  int64 chat_id_;
+  PromisedQueryPtr query_;
+  OnSuccess on_success_;
+};
+
+template <class OnSuccess>
 class Client::TdOnSearchStickerSetCallback : public TdQueryCallback {
  public:
   TdOnSearchStickerSetCallback(PromisedQueryPtr query, OnSuccess on_success)
@@ -3468,7 +3502,6 @@ ServerBotInfo Client::get_bot_info() const {
 void Client::start_up() {
   start_time_ = td::Time::now();
   next_bot_updates_warning_time_ = start_time_ + 600;
-  schedule_next_delete_messages_lru();
   webhook_set_time_ = start_time_;
   next_allowed_set_webhook_time_ = start_time_;
   next_set_webhook_logging_time_ = start_time_;
@@ -3780,6 +3813,26 @@ void Client::check_chat(Slice chat_id_str, AccessRights access_rights, PromisedQ
   send_request(make_object<td_api::getChat>(chat_id),
                std::make_unique<TdOnCheckChatCallback<OnSuccess>>(this, false, access_rights, std::move(query),
                                                                   std::move(on_success)));
+}
+
+template <class OnSuccess>
+void Client::check_chat_no_fail(Slice chat_id_str, PromisedQueryPtr query, OnSuccess on_success) {
+  if (chat_id_str.empty()) {
+    return fail_query(400, "Bad Request: sender_chat_id is empty", std::move(query));
+  }
+
+  auto r_chat_id = td::to_integer_safe<int64>(chat_id_str);
+  if (r_chat_id.is_error()) {
+    return fail_query(400, "Bad Request: sender_chat_id is not a valid Integer", std::move(query));
+  }
+  auto chat_id = r_chat_id.move_as_ok();
+
+  auto chat_info = get_chat(chat_id);
+  if (chat_info != nullptr) {
+    return on_success(chat_id, std::move(query));
+  }
+  send_request(make_object<td_api::getChat>(chat_id), std::make_unique<TdOnCheckChatNoFailCallback<OnSuccess>>(
+                                                          chat_id, std::move(query), std::move(on_success)));
 }
 
 template <class OnSuccess>
@@ -4291,6 +4344,7 @@ void Client::on_update(object_ptr<td_api::Object> result) {
       chat_info->photo = std::move(chat->photo_);
       chat_info->permissions = std::move(chat->permissions_);
       chat_info->message_auto_delete_time = chat->message_ttl_setting_;
+      chat_info->has_protected_content = chat->has_protected_content_;
       break;
     }
     case td_api::updateChatTitle::ID: {
@@ -4321,6 +4375,13 @@ void Client::on_update(object_ptr<td_api::Object> result) {
       chat_info->message_auto_delete_time = update->message_ttl_setting_;
       break;
     }
+    case td_api::updateChatHasProtectedContent::ID: {
+      auto update = move_object_as<td_api::updateChatHasProtectedContent>(result);
+      auto chat_info = add_chat(update->chat_id_);
+      CHECK(chat_info->type != ChatInfo::Type::Unknown);
+      chat_info->has_protected_content = update->has_protected_content_;
+      break;
+    }
     case td_api::updateUser::ID: {
       auto update = move_object_as<td_api::updateUser>(result);
       add_user(users_, std::move(update->user_));
@@ -4330,6 +4391,7 @@ void Client::on_update(object_ptr<td_api::Object> result) {
       auto update = move_object_as<td_api::updateUserFullInfo>(result);
       auto user_id = update->user_id_;
       set_user_bio(user_id, std::move(update->user_full_info_->bio_));
+      set_user_has_private_forwards(user_id, update->user_full_info_->has_private_forwards_);
       break;
     }
     case td_api::updateBasicGroup::ID: {
@@ -4381,6 +4443,9 @@ void Client::on_update(object_ptr<td_api::Object> result) {
       }
       if (name == "group_anonymous_bot_user_id" && update->value_->get_id() == td_api::optionValueInteger::ID) {
         group_anonymous_bot_user_id_ = move_object_as<td_api::optionValueInteger>(update->value_)->value_;
+      }
+      if (name == "channel_bot_user_id" && update->value_->get_id() == td_api::optionValueInteger::ID) {
+        channel_bot_user_id_ = move_object_as<td_api::optionValueInteger>(update->value_)->value_;
       }
       if (name == "telegram_service_notifications_chat_id" &&
           update->value_->get_id() == td_api::optionValueInteger::ID) {
@@ -7623,13 +7688,49 @@ td::Status Client::process_unban_chat_member_query(PromisedQueryPtr &query) {
   return Status::OK();
 }
 
+td::Status Client::process_ban_chat_sender_chat_query(PromisedQueryPtr &query) {
+  auto chat_id = query->arg("chat_id");
+  auto sender_chat_id = query->arg("sender_chat_id");
+  int32 until_date = get_integer_arg(query.get(), "until_date", 0);
+
+  check_chat(chat_id, AccessRights::Write, std::move(query),
+             [this, sender_chat_id = sender_chat_id.str(), until_date](int64 chat_id, PromisedQueryPtr query) {
+               check_chat_no_fail(sender_chat_id, std::move(query),
+                                  [this, chat_id, until_date](int64 sender_chat_id, PromisedQueryPtr query) {
+                                    send_request(
+                                        make_object<td_api::banChatMember>(
+                                            chat_id, td_api::make_object<td_api::messageSenderChat>(sender_chat_id),
+                                            until_date, false),
+                                        std::make_unique<TdOnOkQueryCallback>(std::move(query)));
+                                  });
+             });
+  return Status::OK();
+}
+
+td::Status Client::process_unban_chat_sender_chat_query(PromisedQueryPtr &query) {
+  auto chat_id = query->arg("chat_id");
+  auto sender_chat_id = query->arg("sender_chat_id");
+
+  check_chat(chat_id, AccessRights::Write, std::move(query),
+             [this, sender_chat_id = sender_chat_id.str()](int64 chat_id, PromisedQueryPtr query) {
+               check_chat_no_fail(
+                   sender_chat_id, std::move(query), [this, chat_id](int64 sender_chat_id, PromisedQueryPtr query) {
+                     send_request(make_object<td_api::setChatMemberStatus>(
+                                      chat_id, td_api::make_object<td_api::messageSenderChat>(sender_chat_id),
+                                      make_object<td_api::chatMemberStatusLeft>()),
+                                  std::make_unique<TdOnOkQueryCallback>(std::move(query)));
+                   });
+             });
+  return Status::OK();
+}
+
 td::Status Client::process_approve_chat_join_request_query(PromisedQueryPtr &query) {
   auto chat_id = query->arg("chat_id");
   TRY_RESULT(user_id, get_user_id(query.get()));
 
   check_chat(chat_id, AccessRights::Write, std::move(query), [this, user_id](int64 chat_id, PromisedQueryPtr query) {
     check_user_no_fail(user_id, std::move(query), [this, chat_id, user_id](PromisedQueryPtr query) {
-      send_request(make_object<td_api::approveChatJoinRequest>(chat_id, user_id),
+      send_request(make_object<td_api::processChatJoinRequest>(chat_id, user_id, true),
                    std::make_unique<TdOnOkQueryCallback>(std::move(query)));
     });
   });
@@ -7642,7 +7743,7 @@ td::Status Client::process_decline_chat_join_request_query(PromisedQueryPtr &que
 
   check_chat(chat_id, AccessRights::Write, std::move(query), [this, user_id](int64 chat_id, PromisedQueryPtr query) {
     check_user_no_fail(user_id, std::move(query), [this, chat_id, user_id](PromisedQueryPtr query) {
-      send_request(make_object<td_api::declineChatJoinRequest>(chat_id, user_id),
+      send_request(make_object<td_api::processChatJoinRequest>(chat_id, user_id, false),
                    std::make_unique<TdOnOkQueryCallback>(std::move(query)));
     });
   });
@@ -8346,6 +8447,11 @@ void Client::set_user_bio(int64 user_id, td::string &&bio) {
   user_info->bio = std::move(bio);
 }
 
+void Client::set_user_has_private_forwards(int64 user_id, bool has_private_forwards) {
+  auto user_info = &users_[user_id];
+  user_info->has_private_forwards = has_private_forwards;
+}
+
 void Client::add_group(std::unordered_map<int64, GroupInfo> &groups, object_ptr<td_api::basicGroup> &&group) {
   auto group_info = &groups[group->id_];
   group_info->member_count = group->member_count_;
@@ -9023,8 +9129,8 @@ bool Client::need_skip_update_message(int64 chat_id, const object_ptr<td_api::me
     case td_api::messageProximityAlertTriggered::ID: {
       auto proximity_alert_triggered =
           static_cast<const td_api::messageProximityAlertTriggered *>(message->content_.get());
-      return proximity_alert_triggered->traveler_->get_id() != td_api::messageSenderUser::ID ||
-             proximity_alert_triggered->watcher_->get_id() != td_api::messageSenderUser::ID;
+      return proximity_alert_triggered->traveler_id_->get_id() != td_api::messageSenderUser::ID ||
+             proximity_alert_triggered->watcher_id_->get_id() != td_api::messageSenderUser::ID;
     }
     case td_api::messageGameScore::ID:
       return true;
@@ -9144,6 +9250,11 @@ bool Client::are_equal_inline_keyboard_buttons(const td_api::inlineKeyboardButto
     }
     case td_api::inlineKeyboardButtonTypeBuy::ID:
       return true;
+    case td_api::inlineKeyboardButtonTypeUser::ID: {
+      auto lhs_type = static_cast<const td_api::inlineKeyboardButtonTypeUser *>(lhs->type_.get());
+      auto rhs_type = static_cast<const td_api::inlineKeyboardButtonTypeUser *>(rhs->type_.get());
+      return lhs_type->user_id_ == rhs_type->user_id_;
+    }
     default:
       UNREACHABLE();
       return false;
@@ -9347,56 +9458,10 @@ void Client::delete_message(int64 chat_id, int64 message_id, bool only_from_cach
   }
 
   auto message_info = it->second.get();
-  CHECK(message_info->lru_next != nullptr);
-  message_info->lru_next->lru_prev = message_info->lru_prev;
-  message_info->lru_prev->lru_next = message_info->lru_next;
 
   set_message_reply_to_message_id(message_info, 0);
 
   messages_.erase(it);
-}
-
-void Client::schedule_next_delete_messages_lru() {
-  CHECK(!next_delete_messages_lru_timeout_.has_timeout());
-  next_delete_messages_lru_timeout_.set_callback(Client::delete_messages_lru);
-  next_delete_messages_lru_timeout_.set_callback_data(static_cast<void *>(this));
-  next_delete_messages_lru_timeout_.set_timeout_in(td::Random::fast(MESSAGES_CACHE_TIME, 2 * MESSAGES_CACHE_TIME));
-}
-
-void Client::delete_messages_lru(void *client_void) {
-  CHECK(client_void != nullptr);
-  auto client = static_cast<Client *>(client_void);
-
-  auto now = td::Time::now();
-  int32 deleted_message_count = 0;
-  while (client->messages_lru_root_.lru_next->access_time < now - MESSAGES_CACHE_TIME) {
-    auto message = client->messages_lru_root_.lru_next;
-    if (client->yet_unsent_reply_message_ids_.count({message->chat_id, message->id})) {
-      LOG(DEBUG) << "Force usage of message " << message->id << " in " << message->chat_id;
-      client->update_message_lru(message);
-    } else {
-      client->delete_message(message->chat_id, message->id, true);
-      deleted_message_count++;
-    }
-  }
-
-  if (deleted_message_count != 0) {
-    LOG(DEBUG) << "Delete " << deleted_message_count << " messages from cache";
-  }
-  client->schedule_next_delete_messages_lru();
-}
-
-void Client::update_message_lru(const MessageInfo *message_info) const {
-  message_info->access_time = td::Time::now();
-  if (message_info->lru_next != nullptr) {
-    message_info->lru_next->lru_prev = message_info->lru_prev;
-    message_info->lru_prev->lru_next = message_info->lru_next;
-  }
-  auto prev = messages_lru_root_.lru_prev;
-  message_info->lru_prev = prev;
-  prev->lru_next = message_info;
-  message_info->lru_next = &messages_lru_root_;
-  messages_lru_root_.lru_prev = message_info;
 }
 
 Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message, bool force_update_content) {
@@ -9415,41 +9480,12 @@ Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message,
     message_info = std::move(it->second);
   }
 
-  update_message_lru(message_info.get());
-
   message_info->id = message_id;
   message_info->chat_id = chat_id;
   message_info->date = message->date_;
   message_info->edit_date = message->edit_date_;
   message_info->media_album_id = message->media_album_id_;
   message_info->via_bot_user_id = message->via_bot_user_id_;
-
-  CHECK(message->sender_ != nullptr);
-  switch (message->sender_->get_id()) {
-    case td_api::messageSenderUser::ID: {
-      auto sender = move_object_as<td_api::messageSenderUser>(message->sender_);
-      message_info->sender_user_id = sender->user_id_;
-      CHECK(message_info->sender_user_id > 0);
-      break;
-    }
-    case td_api::messageSenderChat::ID: {
-      auto sender = move_object_as<td_api::messageSenderChat>(message->sender_);
-      message_info->sender_chat_id = sender->chat_id_;
-
-      auto chat_type = get_chat_type(chat_id);
-      if (chat_type != ChatType::Channel) {
-        if (message_info->sender_chat_id == chat_id) {
-          message_info->sender_user_id = group_anonymous_bot_user_id_;
-        } else {
-          message_info->sender_user_id = service_notifications_user_id_;
-        }
-        CHECK(message_info->sender_user_id > 0);
-      }
-      break;
-    }
-    default:
-      UNREACHABLE();
-  }
 
   message_info->initial_chat_id = 0;
   message_info->initial_sender_user_id = 0;
@@ -9493,8 +9529,42 @@ Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message,
       default:
         UNREACHABLE();
     }
+    auto from_chat_id = message->forward_info_->from_chat_id_;
+    message_info->is_automatic_forward =
+        from_chat_id != 0 && from_chat_id != chat_id && message->forward_info_->from_message_id_ != 0 &&
+        get_chat_type(chat_id) == ChatType::Supergroup && get_chat_type(from_chat_id) == ChatType::Channel;
   }
 
+  CHECK(message->sender_id_ != nullptr);
+  switch (message->sender_id_->get_id()) {
+    case td_api::messageSenderUser::ID: {
+      auto sender_id = move_object_as<td_api::messageSenderUser>(message->sender_id_);
+      message_info->sender_user_id = sender_id->user_id_;
+      CHECK(message_info->sender_user_id > 0);
+      break;
+    }
+    case td_api::messageSenderChat::ID: {
+      auto sender_id = move_object_as<td_api::messageSenderChat>(message->sender_id_);
+      message_info->sender_chat_id = sender_id->chat_id_;
+
+      auto chat_type = get_chat_type(chat_id);
+      if (chat_type != ChatType::Channel) {
+        if (message_info->sender_chat_id == chat_id) {
+          message_info->sender_user_id = group_anonymous_bot_user_id_;
+        } else if (message_info->is_automatic_forward) {
+          message_info->sender_user_id = service_notifications_user_id_;
+        } else {
+          message_info->sender_user_id = channel_bot_user_id_;
+        }
+        CHECK(message_info->sender_user_id > 0);
+      }
+      break;
+    }
+    default:
+      UNREACHABLE();
+  }
+
+  message_info->can_be_saved = message->can_be_saved_;
   message_info->author_signature = std::move(message->author_signature_);
 
   if (message->reply_in_chat_id_ != chat_id && message->reply_to_message_id_ != 0) {
@@ -9551,9 +9621,7 @@ const Client::MessageInfo *Client::get_message(int64 chat_id, int64 message_id) 
   }
   LOG(DEBUG) << "Found message " << message_id << " from chat " << chat_id;
 
-  auto result = it->second.get();
-  update_message_lru(result);
-  return result;
+  return it->second.get();
 }
 
 Client::MessageInfo *Client::get_message_editable(int64 chat_id, int64 message_id) {
@@ -9564,9 +9632,7 @@ Client::MessageInfo *Client::get_message_editable(int64 chat_id, int64 message_i
   }
   LOG(DEBUG) << "Found message " << message_id << " from chat " << chat_id;
 
-  auto result = it->second.get();
-  update_message_lru(result);
-  return result;
+  return it->second.get();
 }
 
 td::string Client::get_chat_member_status(const object_ptr<td_api::ChatMemberStatus> &status) {
