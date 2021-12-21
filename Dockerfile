@@ -16,5 +16,5 @@ FROM busybox:glibc
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /src/telegram-bot-api/build/telegram-bot-api /usr/local/bin/telegram-bot-api
 
-ENTRYPOINT ["/app/telegram-bot-api"]
+ENTRYPOINT ["/usr/local/bin/telegram-bot-api"]
 
