@@ -1,4 +1,4 @@
-name: CMake
+name: docker-buildx
 
 on: [push]
 
@@ -19,6 +19,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Download a Build Artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: cmake.yml
+          name: telegram-bot-api
+          path: ${{ github.workspace }}/bin
+          
+      - run: chmod +x ${{ github.workspace }}/bin/telegram-bot-api
 
       - name: Build and Push
         id: docker_build
