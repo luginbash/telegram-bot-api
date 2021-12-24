@@ -46,6 +46,8 @@ jobs:
         name: telegram-bot-api
         path: '${{ github.workspace }}/telegram-bot-api'
         
+    - run: 'ls -R ${{ github.workspace }}'
+        
     - name: Create Release
       id: create_release
       uses: actions/create-release@v1
