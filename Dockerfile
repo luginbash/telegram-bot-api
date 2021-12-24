@@ -1,7 +1,7 @@
 ARG GITHUB_WORKSPACE
 FROM debian:11-slim 
 
-COPY ${GITHUB_WORKSPACE}/bin/telegram-bot-api /usr/bin/telegram-bot-api
+COPY ./bin/telegram-bot-api /usr/bin/telegram-bot-api
 
 RUN ldd  /usr/bin/telegram-bot-api
 
