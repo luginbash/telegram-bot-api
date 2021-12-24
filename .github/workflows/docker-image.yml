@@ -29,14 +29,11 @@ jobs:
           
       - run: chmod +x ${{ github.workspace }}/bin/telegram-bot-api && ls -R ${{ github.workspace }}
 
-      - name: Build and Push
+      - name: Build 
         id: docker_build
-        uses: docker/build-push-action@v2
-        with:
-          push: true
-          tags: ghcr.io/${{github.actor}}/${{github.repository}}:latest       
-
-      - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
+        run: docker build . -t ghcr.io/${{github.actor}}/${{github.repository}}:latest
+        
+      - name: Docker push
+        run: docker push ghcr.io/${{github.actor}}/${{github.repository}}:latest      
         
 
