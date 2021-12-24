@@ -44,7 +44,7 @@ jobs:
       uses: actions/upload-artifact@v2.3.1
       with:
         name: telegram-bot-api
-        path: '${{ github.workspace }}/telegram-bot-api'
+        path: '${{ github.workspace }}/build/telegram-bot-api'
         
     - run: 'ls -R ${{ github.workspace }}'
         
@@ -65,8 +65,8 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/telegram-bot-api'
+        upload_url: '${{ steps.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/build/telegram-bot-api'
         asset_name: telegram-bot-api
         asset_content_type: application/octet-stream
       
