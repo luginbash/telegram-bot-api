@@ -39,6 +39,12 @@ jobs:
           cmakeAppendedArgs: '-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -D CMAKE_C_COMPILER_LAUNCHER=ccache -D CMAKE_CXX_COMPILER_LAUNCHER=ccache'
           buildWithCMake: true
           buildDirectory: '${{ github.workspace }}/build'
+          
+    - name: Upload a Build Artifact
+      uses: actions/upload-artifact@v2.3.1
+      with:
+        name: telegram-bot-api
+        path: ${{ github.workspace }}/build/telegram-bot-api
         
     - name: Create Release
       id: create_release
