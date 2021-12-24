@@ -27,13 +27,12 @@ jobs:
           name: telegram-bot-api
           path: ${{ github.workspace }}/bin
           
-      - run: chmod +x ${{ github.workspace }}/bin/telegram-bot-api
+      - run: chmod +x ${{ github.workspace }}/bin/telegram-bot-api && ls -R ${{ github.workspace }}
 
       - name: Build and Push
         id: docker_build
         uses: docker/build-push-action@v2
         with:
-          context: ${{ github.workspace }}
           push: true
           tags: ghcr.io/${{github.actor}}/${{github.repository}}:latest       
 
