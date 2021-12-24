@@ -19,6 +19,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Download a Build Artifact
+        uses: actions/download-artifact@v2.1.0
+        with:
+          name: telegram-bot-api
+          # Destination path
+          path: telegram-bot-api.bin
+          
+      - run: chmod +x telegram-bot-api.bin
 
       - name: Build and Push
         id: docker_build
