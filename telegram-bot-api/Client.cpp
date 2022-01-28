@@ -417,6 +417,9 @@ class Client::JsonEntity : public Jsonable {
       case td_api::textEntityTypeStrikethrough::ID:
         object("type", "strikethrough");
         break;
+      case td_api::textEntityTypeSpoiler::ID:
+        object("type", "spoiler");
+        break;
       case td_api::textEntityTypeCode::ID:
         object("type", "code");
         break;
@@ -563,8 +566,8 @@ class Client::JsonChatInviteLink : public Jsonable {
       object("name", chat_invite_link_->name_);
     }
     object("creator", JsonUser(chat_invite_link_->creator_user_id_, client_));
-    if (chat_invite_link_->expire_date_ != 0) {
-      object("expire_date", chat_invite_link_->expire_date_);
+    if (chat_invite_link_->expiration_date_ != 0) {
+      object("expire_date", chat_invite_link_->expiration_date_);
     }
     if (chat_invite_link_->member_limit_ != 0) {
       object("member_limit", chat_invite_link_->member_limit_);
@@ -2626,7 +2629,7 @@ class Client::TdOnDeleteFailedToSendMessageCallback : public TdQueryCallback {
   void on_result(object_ptr<td_api::Object> result) override {
     if (result->get_id() == td_api::error::ID) {
       auto error = move_object_as<td_api::error>(result);
-      if (error->code_ != 401) {
+      if (error->code_ != 401 && !client_->need_close_ && !client_->closing_ && !client_->logging_out_) {
         LOG(ERROR) << "Can't delete failed to send message " << message_id_ << " because of "
                    << td::oneline(to_string(error)) << " in " << client_->get_chat_description(chat_id_)
                    << ". Old chat description: " << old_chat_description_;
@@ -2897,10 +2900,11 @@ class Client::TdOnResolveBotUsernameCallback : public TdQueryCallback {
 template <class OnSuccess>
 class Client::TdOnCheckMessageCallback : public TdQueryCallback {
  public:
-  TdOnCheckMessageCallback(Client *client, int64 chat_id, bool allow_empty, Slice message_type, PromisedQueryPtr query,
-                           OnSuccess on_success)
+  TdOnCheckMessageCallback(Client *client, int64 chat_id, int64 message_id, bool allow_empty, Slice message_type,
+                           PromisedQueryPtr query, OnSuccess on_success)
       : client_(client)
       , chat_id_(chat_id)
+      , message_id_(message_id)
       , allow_empty_(allow_empty)
       , message_type_(message_type)
       , query_(std::move(query))
@@ -2911,7 +2915,7 @@ class Client::TdOnCheckMessageCallback : public TdQueryCallback {
     if (result->get_id() == td_api::error::ID) {
       auto error = move_object_as<td_api::error>(result);
       if (error->code_ == 429) {
-        LOG(WARNING) << "Failed to get " << message_type_;
+        LOG(WARNING) << "Failed to get message " << message_id_ << " in " << chat_id_ << ": " << message_type_;
       }
       if (allow_empty_) {
         return on_success_(chat_id_, 0, std::move(query_));
@@ -2922,12 +2926,14 @@ class Client::TdOnCheckMessageCallback : public TdQueryCallback {
     CHECK(result->get_id() == td_api::message::ID);
     auto full_message_id = client_->add_message(move_object_as<td_api::message>(result));
     CHECK(full_message_id.chat_id == chat_id_);
+    CHECK(full_message_id.message_id == message_id_);
     on_success_(full_message_id.chat_id, full_message_id.message_id, std::move(query_));
   }
 
  private:
   Client *client_;
   int64 chat_id_;
+  int64 message_id_;
   bool allow_empty_;
   Slice message_type_;
   PromisedQueryPtr query_;
@@ -3923,9 +3929,10 @@ void Client::check_message(Slice chat_id_str, int64 message_id, bool allow_empty
                  return on_success(chat_id, 0, std::move(query));
                }
 
-               send_request(make_object<td_api::getMessage>(chat_id, message_id),
-                            std::make_unique<TdOnCheckMessageCallback<OnSuccess>>(
-                                this, chat_id, allow_empty, message_type, std::move(query), std::move(on_success)));
+               send_request(
+                   make_object<td_api::getMessage>(chat_id, message_id),
+                   std::make_unique<TdOnCheckMessageCallback<OnSuccess>>(
+                       this, chat_id, message_id, allow_empty, message_type, std::move(query), std::move(on_success)));
              });
 }
 
@@ -4171,6 +4178,7 @@ void Client::on_update_authorization_state() {
     case td_api::authorizationStateReady::ID: {
       auto user_info = get_user_info(my_id_);
       if (my_id_ <= 0 || user_info == nullptr) {
+        LOG(INFO) << "Send getMe request for " << my_id_;
         return send_request(make_object<td_api::getMe>(), std::make_unique<TdOnAuthorizationCallback>(this));
       }
 
@@ -4224,7 +4232,7 @@ bool Client::allow_update_before_authorization(const td_api::Object *update) con
     return name == "my_id" || name == "unix_time";
   }
   if (update_id == td_api::updateUser::ID) {
-    return static_cast<const td_api::updateUser *>(update)->user_->id_ == my_id_;
+    return true;
   }
   return false;
 }
@@ -4343,7 +4351,7 @@ void Client::on_update(object_ptr<td_api::Object> result) {
       chat_info->title = std::move(chat->title_);
       chat_info->photo = std::move(chat->photo_);
       chat_info->permissions = std::move(chat->permissions_);
-      chat_info->message_auto_delete_time = chat->message_ttl_setting_;
+      chat_info->message_auto_delete_time = chat->message_ttl_;
       chat_info->has_protected_content = chat->has_protected_content_;
       break;
     }
@@ -4368,11 +4376,11 @@ void Client::on_update(object_ptr<td_api::Object> result) {
       chat_info->permissions = std::move(update->permissions_);
       break;
     }
-    case td_api::updateChatMessageTtlSetting::ID: {
-      auto update = move_object_as<td_api::updateChatMessageTtlSetting>(result);
+    case td_api::updateChatMessageTtl::ID: {
+      auto update = move_object_as<td_api::updateChatMessageTtl>(result);
       auto chat_info = add_chat(update->chat_id_);
       CHECK(chat_info->type != ChatInfo::Type::Unknown);
-      chat_info->message_auto_delete_time = update->message_ttl_setting_;
+      chat_info->message_auto_delete_time = update->message_ttl_;
       break;
     }
     case td_api::updateChatHasProtectedContent::ID: {
@@ -5249,8 +5257,9 @@ td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_me
   return nullptr;
 }
 
-td_api::object_ptr<td_api::messageSendOptions> Client::get_message_send_options(bool disable_notification) {
-  return make_object<td_api::messageSendOptions>(disable_notification, false, nullptr);
+td_api::object_ptr<td_api::messageSendOptions> Client::get_message_send_options(bool disable_notification,
+                                                                                bool protect_content) {
+  return make_object<td_api::messageSendOptions>(disable_notification, false, protect_content, nullptr);
 }
 
 td::Result<td::vector<td_api::object_ptr<td_api::InputInlineQueryResult>>> Client::get_inline_query_results(
@@ -5932,6 +5941,9 @@ td::Result<td_api::object_ptr<td_api::TextEntityType>> Client::get_text_entity_t
   }
   if (type == "strikethrough") {
     return make_object<td_api::textEntityTypeStrikethrough>();
+  }
+  if (type == "spoiler") {
+    return make_object<td_api::textEntityTypeSpoiler>();
   }
   if (type == "code") {
     return make_object<td_api::textEntityTypeCode>();
@@ -6846,6 +6858,7 @@ td::Status Client::process_send_media_group_query(PromisedQueryPtr &query) {
   auto reply_to_message_id = get_message_id(query.get(), "reply_to_message_id");
   auto allow_sending_without_reply = to_bool(query->arg("allow_sending_without_reply"));
   auto disable_notification = to_bool(query->arg("disable_notification"));
+  auto protect_content = to_bool(query->arg("protect_content"));
   // TRY_RESULT(reply_markup, get_reply_markup(query.get()));
   auto reply_markup = nullptr;
   TRY_RESULT(input_message_contents, get_input_message_contents(query.get(), "media"));
@@ -6853,9 +6866,10 @@ td::Status Client::process_send_media_group_query(PromisedQueryPtr &query) {
   resolve_reply_markup_bot_usernames(
       std::move(reply_markup), std::move(query),
       [this, chat_id = chat_id.str(), reply_to_message_id, allow_sending_without_reply, disable_notification,
-       input_message_contents = std::move(input_message_contents)](object_ptr<td_api::ReplyMarkup> reply_markup,
-                                                                   PromisedQueryPtr query) mutable {
-        auto on_success = [this, disable_notification, input_message_contents = std::move(input_message_contents),
+       protect_content, input_message_contents = std::move(input_message_contents)](
+          object_ptr<td_api::ReplyMarkup> reply_markup, PromisedQueryPtr query) mutable {
+        auto on_success = [this, disable_notification, protect_content,
+                           input_message_contents = std::move(input_message_contents),
                            reply_markup = std::move(reply_markup)](int64 chat_id, int64 reply_to_message_id,
                                                                    PromisedQueryPtr query) mutable {
           auto it = yet_unsent_message_count_.find(chat_id);
@@ -6863,10 +6877,11 @@ td::Status Client::process_send_media_group_query(PromisedQueryPtr &query) {
             return query->set_retry_after_error(60);
           }
 
-          send_request(make_object<td_api::sendMessageAlbum>(chat_id, 0, reply_to_message_id,
-                                                             get_message_send_options(disable_notification),
-                                                             std::move(input_message_contents)),
-                       std::make_unique<TdOnSendMessageAlbumCallback>(this, std::move(query)));
+          send_request(
+              make_object<td_api::sendMessageAlbum>(chat_id, 0, reply_to_message_id,
+                                                    get_message_send_options(disable_notification, protect_content),
+                                                    std::move(input_message_contents)),
+              std::make_unique<TdOnSendMessageAlbumCallback>(this, std::move(query)));
         };
         check_message(chat_id, reply_to_message_id, reply_to_message_id <= 0 || allow_sending_without_reply,
                       AccessRights::Write, "replied message", std::move(query), std::move(on_success));
@@ -8184,6 +8199,7 @@ void Client::do_send_message(object_ptr<td_api::InputMessageContent> input_messa
   auto reply_to_message_id = get_message_id(query.get(), "reply_to_message_id");
   auto allow_sending_without_reply = to_bool(query->arg("allow_sending_without_reply"));
   auto disable_notification = to_bool(query->arg("disable_notification"));
+  auto protect_content = to_bool(query->arg("protect_content"));
   auto r_reply_markup = get_reply_markup(query.get());
   if (r_reply_markup.is_error()) {
     return fail_query_with_error(std::move(query), 400, r_reply_markup.error().message());
@@ -8193,9 +8209,10 @@ void Client::do_send_message(object_ptr<td_api::InputMessageContent> input_messa
   resolve_reply_markup_bot_usernames(
       std::move(reply_markup), std::move(query),
       [this, chat_id = chat_id.str(), reply_to_message_id, allow_sending_without_reply, disable_notification,
-       input_message_content = std::move(input_message_content)](object_ptr<td_api::ReplyMarkup> reply_markup,
-                                                                 PromisedQueryPtr query) mutable {
-        auto on_success = [this, disable_notification, input_message_content = std::move(input_message_content),
+       protect_content, input_message_content = std::move(input_message_content)](
+          object_ptr<td_api::ReplyMarkup> reply_markup, PromisedQueryPtr query) mutable {
+        auto on_success = [this, disable_notification, protect_content,
+                           input_message_content = std::move(input_message_content),
                            reply_markup = std::move(reply_markup)](int64 chat_id, int64 reply_to_message_id,
                                                                    PromisedQueryPtr query) mutable {
           auto it = yet_unsent_message_count_.find(chat_id);
@@ -8204,7 +8221,7 @@ void Client::do_send_message(object_ptr<td_api::InputMessageContent> input_messa
           }
 
           send_request(make_object<td_api::sendMessage>(chat_id, 0, reply_to_message_id,
-                                                        get_message_send_options(disable_notification),
+                                                        get_message_send_options(disable_notification, protect_content),
                                                         std::move(reply_markup), std::move(input_message_content)),
                        std::make_unique<TdOnSendMessageCallback>(this, std::move(query)));
         };
