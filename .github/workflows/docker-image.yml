@@ -61,6 +61,22 @@ jobs:
         asset_name: telegram-bot-api
         asset_content_type: application/octet-stream
         
+  notify-cmake-built-telegram:
+    needs: cmake-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: send telegram message on push
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            A newer binary for ${{ github.repository }} has been built.
+            
+            Commit message: ${{ github.event.commits[0].message }}
+            
+            See changes: https://github.com/${{ github.repository }}/commit/${{github.sha}}
+        
   docker-build-and-push:
      runs-on: ubuntu-latest
      needs: cmake-build
@@ -95,4 +111,16 @@ jobs:
       - name: Docker push
         run: docker push ghcr.io/${{github.actor}}/${{github.repository}}:latest      
         
-
+  notify-image-built-and-pushed-telegram:
+    needs: docker-build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: send telegram message on push
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            A newer image for ${{ github.repository }} has been built and deployed.
+            
+            See changes: https://github.com/${{ github.repository }}/commit/${{github.sha}}
