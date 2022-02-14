@@ -106,10 +106,10 @@ jobs:
 
       - name: Build 
         id: docker_build
-        run: docker build . -t ghcr.io/${{github.actor}}/${{github.repository}}:latest
+        run: docker build . -t ghcr.io/${{github.repository}}:latest
         
       - name: Docker push
-        run: docker push ghcr.io/${{github.actor}}/${{github.repository}}:latest      
+        run: docker push ghcr.io/${{github.repository}}:latest      
         
   notify-image-built-and-pushed-telegram:
     needs: docker-build-and-push
