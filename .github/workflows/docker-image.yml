@@ -105,9 +105,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
           
       - name: Download a Build Artifact
-        uses: dawidd6/action-download-artifact@v2
+        uses: actions/download-artifact@v3.0.1
         with:
-          workflow: cmake.yml
           name: telegram-bot-api
           path: ${{ github.workspace }}/bin
           
