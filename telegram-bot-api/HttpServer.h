@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2023
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -46,7 +46,7 @@ class HttpServer final : public td::TcpListener::Callback {
       set_timeout_at(wakeup_at);
       return;
     }
-    flood_control_.add_event(static_cast<td::int32>(now));
+    flood_control_.add_event(now);
     LOG(INFO) << "Create tcp listener " << td::tag("address", ip_address_) << td::tag("port", port_);
     listener_ = td::create_actor<td::TcpListener>(
         PSLICE() << "TcpListener" << td::tag("address", ip_address_) << td::tag("port", port_), port_,

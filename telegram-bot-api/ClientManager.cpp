@@ -1,12 +1,11 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2023
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "telegram-bot-api/ClientManager.h"
 
-#include "telegram-bot-api/Client.h"
 #include "telegram-bot-api/ClientParameters.h"
 #include "telegram-bot-api/WebhookActor.h"
 
@@ -30,13 +29,17 @@
 #include "td/utils/Parser.h"
 #include "td/utils/port/IPAddress.h"
 #include "td/utils/port/Stat.h"
+#include "td/utils/port/thread.h"
 #include "td/utils/Slice.h"
 #include "td/utils/SliceBuilder.h"
 #include "td/utils/StackAllocator.h"
 #include "td/utils/StringBuilder.h"
 #include "td/utils/Time.h"
 
-#include <map>
+#include "memprof/memprof.h"
+
+#include <algorithm>
+#include <atomic>
 #include <tuple>
 
 namespace telegram_bot_api {
@@ -48,6 +51,8 @@ void ClientManager::close(td::Promise<td::Unit> &&promise) {
   }
 
   close_flag_ = true;
+  watchdog_id_.reset();
+  dump_statistics();
   auto ids = clients_.ids();
   for (auto id : ids) {
     auto *client_info = clients_.get(id);
@@ -109,13 +114,13 @@ void ClientManager::send(PromisedQueryPtr query) {
         flood_control.add_limit(60, 20);        // 20 in a minute
         flood_control.add_limit(60 * 60, 600);  // 600 in an hour
       }
-      auto now = static_cast<td::uint32>(td::Time::now());
-      td::uint32 wakeup_at = flood_control.get_wakeup_at();
+      auto now = td::Time::now();
+      auto wakeup_at = flood_control.get_wakeup_at();
       if (wakeup_at > now) {
         LOG(INFO) << "Failed to create Client from IP address " << ip_address;
         return query->set_retry_after_error(static_cast<int>(wakeup_at - now) + 1);
       }
-      flood_control.add_event(static_cast<td::int32>(now));
+      flood_control.add_event(now);
     }
     auto tqueue_id = get_tqueue_id(user_id, query->is_test_dc());
     if (active_client_count_.count(tqueue_id) != 0) {
@@ -143,6 +148,39 @@ void ClientManager::send(PromisedQueryPtr query) {
   }
   send_closure(clients_.get(id_it->second)->client_, &Client::send,
                std::move(query));  // will send 429 if the client is already closed
+}
+
+ClientManager::TopClients ClientManager::get_top_clients(std::size_t max_count, td::Slice token_filter) {
+  auto now = td::Time::now();
+  TopClients result;
+  td::vector<std::pair<td::int64, td::uint64>> top_client_ids;
+  for (auto id : clients_.ids()) {
+    auto *client_info = clients_.get(id);
+    CHECK(client_info);
+
+    if (client_info->stat_.is_active(now)) {
+      result.active_count++;
+    }
+
+    if (!td::begins_with(client_info->token_, token_filter)) {
+      continue;
+    }
+
+    auto score = static_cast<td::int64>(client_info->stat_.get_score(now) * -1e9);
+    if (score == 0 && top_client_ids.size() >= max_count) {
+      continue;
+    }
+    top_client_ids.emplace_back(score, id);
+  }
+  if (top_client_ids.size() < max_count) {
+    max_count = top_client_ids.size();
+  }
+  std::partial_sort(top_client_ids.begin(), top_client_ids.begin() + max_count, top_client_ids.end());
+  result.top_client_ids.reserve(max_count);
+  for (std::size_t i = 0; i < max_count; i++) {
+    result.top_client_ids.push_back(top_client_ids[i].second);
+  }
+  return result;
 }
 
 void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
@@ -181,35 +219,12 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
   }
 
   auto now = td::Time::now();
-  td::int32 active_bot_count = 0;
-  std::multimap<td::int64, td::uint64> top_bot_ids;
-  for (auto id : clients_.ids()) {
-    auto *client_info = clients_.get(id);
-    CHECK(client_info);
-
-    if (client_info->stat_.is_active(now)) {
-      active_bot_count++;
-    }
-
-    if (!td::begins_with(client_info->token_, id_filter)) {
-      continue;
-    }
-
-    auto stats = client_info->stat_.as_vector(now);
-    double score = 0.0;
-    for (auto &stat : stats) {
-      if (stat.key_ == "update_count" || stat.key_ == "request_count") {
-        score -= td::to_double(stat.value_);
-      }
-    }
-    top_bot_ids.emplace(static_cast<td::int64>(score * 1e9), id);
-  }
-
+  auto top_clients = get_top_clients(50, id_filter);
   sb << stat_.get_description() << '\n';
   if (id_filter.empty()) {
     sb << "uptime\t" << now - parameters_->start_time_ << '\n';
     sb << "bot_count\t" << clients_.size() << '\n';
-    sb << "active_bot_count\t" << active_bot_count << '\n';
+    sb << "active_bot_count\t" << top_clients.active_count << '\n';
     auto r_mem_stat = td::mem_stat();
     if (r_mem_stat.is_ok()) {
       auto mem_stat = r_mem_stat.move_as_ok();
@@ -228,8 +243,8 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
     }
 
     sb << "buffer_memory\t" << td::format::as_size(td::BufferAllocator::get_buffer_mem()) << '\n';
-    sb << "active_webhook_connections\t" << WebhookActor::get_total_connections_count() << '\n';
-    sb << "active_requests\t" << parameters_->shared_data_->query_count_.load() << '\n';
+    sb << "active_webhook_connections\t" << WebhookActor::get_total_connection_count() << '\n';
+    sb << "active_requests\t" << parameters_->shared_data_->query_count_.load(std::memory_order_relaxed) << '\n';
     sb << "active_network_queries\t" << td::get_pending_network_query_count(*parameters_->net_query_stats_) << '\n';
     auto stats = stat_.as_vector(now);
     for (auto &stat : stats) {
@@ -237,23 +252,42 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
     }
   }
 
-  for (auto top_bot_id : top_bot_ids) {
-    auto *client_info = clients_.get(top_bot_id.second);
+  for (auto top_client_id : top_clients.top_client_ids) {
+    auto *client_info = clients_.get(top_client_id);
     CHECK(client_info);
 
-    auto bot_info = client_info->client_->get_actor_unsafe()->get_bot_info();
+    auto bot_info = client_info->client_.get_actor_unsafe()->get_bot_info();
+    auto active_request_count = client_info->stat_.get_active_request_count();
+    auto active_file_upload_bytes = client_info->stat_.get_active_file_upload_bytes();
+    auto active_file_upload_count = client_info->stat_.get_active_file_upload_count();
     sb << '\n';
     sb << "id\t" << bot_info.id_ << '\n';
     sb << "uptime\t" << now - bot_info.start_time_ << '\n';
     sb << "token\t" << bot_info.token_ << '\n';
     sb << "username\t" << bot_info.username_ << '\n';
-    sb << "is_active\t" << client_info->stat_.is_active(now) << '\n';
-    sb << "webhook\t" << bot_info.webhook_ << '\n';
-    sb << "has_custom_certificate\t" << bot_info.has_webhook_certificate_ << '\n';
+    if (active_request_count != 0) {
+      sb << "active_request_count\t" << active_request_count << '\n';
+    }
+    if (active_file_upload_bytes != 0) {
+      sb << "active_file_upload_bytes\t" << active_file_upload_bytes << '\n';
+    }
+    if (active_file_upload_count != 0) {
+      sb << "active_file_upload_count\t" << active_file_upload_count << '\n';
+    }
+    if (!bot_info.webhook_.empty()) {
+      sb << "webhook\t" << bot_info.webhook_ << '\n';
+      if (bot_info.has_webhook_certificate_) {
+        sb << "has_custom_certificate\t" << bot_info.has_webhook_certificate_ << '\n';
+      }
+      if (bot_info.webhook_max_connections_ != parameters_->default_max_webhook_connections_) {
+        sb << "webhook_max_connections\t" << bot_info.webhook_max_connections_ << '\n';
+      }
+    }
     sb << "head_update_id\t" << bot_info.head_update_id_ << '\n';
-    sb << "tail_update_id\t" << bot_info.tail_update_id_ << '\n';
-    sb << "pending_update_count\t" << bot_info.pending_update_count_ << '\n';
-    sb << "webhook_max_connections\t" << bot_info.webhook_max_connections_ << '\n';
+    if (bot_info.pending_update_count_ != 0) {
+      sb << "tail_update_id\t" << bot_info.tail_update_id_ << '\n';
+      sb << "pending_update_count\t" << bot_info.pending_update_count_ << '\n';
+    }
 
     auto stats = client_info->stat_.as_vector(now);
     for (auto &stat : stats) {
@@ -276,9 +310,7 @@ td::int64 ClientManager::get_tqueue_id(td::int64 user_id, bool is_test_dc) {
 
 void ClientManager::start_up() {
   //NB: the same scheduler as for database in Td
-  auto current_scheduler_id = td::Scheduler::instance()->sched_id();
-  auto scheduler_count = td::Scheduler::instance()->sched_count();
-  auto scheduler_id = td::min(current_scheduler_id + 1, scheduler_count - 1);
+  auto scheduler_id = 1;
 
   // init tqueue
   {
@@ -316,13 +348,14 @@ void ClientManager::start_up() {
 
     LOG(WARNING) << "Loaded " << loaded_event_count << " TQueue events in " << (td::Time::now() - load_start_time)
                  << " seconds";
+    next_tqueue_gc_time_ = td::Time::now() + 600;
   }
 
   // init webhook_db
   auto concurrent_webhook_db = td::make_unique<td::BinlogKeyValue<td::ConcurrentBinlog>>();
   auto status = concurrent_webhook_db->init(parameters_->working_directory_ + "webhooks_db.binlog", td::DbKey::empty(),
                                             scheduler_id);
-  LOG_IF(FATAL, status.is_error()) << "Can't open webhooks_db.binlog " << status.error();
+  LOG_IF(FATAL, status.is_error()) << "Can't open webhooks_db.binlog " << status;
   parameters_->shared_data_->webhook_db_ = std::move(concurrent_webhook_db);
 
   auto &webhook_db = *parameters_->shared_data_->webhook_db_;
@@ -336,6 +369,11 @@ void ClientManager::start_up() {
     auto query = get_webhook_restore_query(key_value.first, key_value.second, parameters_->shared_data_);
     send_closure_later(actor_id(this), &ClientManager::send, std::move(query));
   }
+
+  // launch watchdog
+  watchdog_id_ = td::create_actor_on_scheduler<Watchdog>(
+      "ManagerWatchdog", td::Scheduler::instance()->sched_count() - 3, td::this_thread::get_id(), WATCHDOG_TIMEOUT);
+  set_timeout_in(600.0);
 }
 
 PromisedQueryPtr ClientManager::get_webhook_restore_query(td::Slice token, td::Slice webhook_info,
@@ -344,7 +382,7 @@ PromisedQueryPtr ClientManager::get_webhook_restore_query(td::Slice token, td::S
   td::vector<td::BufferSlice> containers;
   auto add_string = [&containers](td::Slice str) {
     containers.emplace_back(str);
-    return containers.back().as_slice();
+    return containers.back().as_mutable_slice();
   };
 
   token = add_string(token);
@@ -397,6 +435,92 @@ PromisedQueryPtr ClientManager::get_webhook_restore_query(td::Slice token, td::S
   return PromisedQueryPtr(query.release(), PromiseDeleter(td::Promise<td::unique_ptr<Query>>()));
 }
 
+void ClientManager::dump_statistics() {
+  if (is_memprof_on()) {
+    LOG(WARNING) << "Memory dump:";
+    td::vector<AllocInfo> v;
+    dump_alloc([&](const AllocInfo &info) { v.push_back(info); });
+    std::sort(v.begin(), v.end(), [](const AllocInfo &a, const AllocInfo &b) { return a.size > b.size; });
+    size_t total_size = 0;
+    size_t other_size = 0;
+    int count = 0;
+    for (auto &info : v) {
+      if (count++ < 50) {
+        LOG(WARNING) << td::format::as_size(info.size) << td::format::as_array(info.backtrace);
+      } else {
+        other_size += info.size;
+      }
+      total_size += info.size;
+    }
+    LOG(WARNING) << td::tag("other", td::format::as_size(other_size));
+    LOG(WARNING) << td::tag("total size", td::format::as_size(total_size));
+    LOG(WARNING) << td::tag("total traces", get_ht_size());
+    LOG(WARNING) << td::tag("fast_backtrace_success_rate", get_fast_backtrace_success_rate());
+  }
+  auto r_mem_stat = td::mem_stat();
+  if (r_mem_stat.is_ok()) {
+    auto mem_stat = r_mem_stat.move_as_ok();
+    LOG(WARNING) << td::tag("rss", td::format::as_size(mem_stat.resident_size_));
+    LOG(WARNING) << td::tag("vm", td::format::as_size(mem_stat.virtual_size_));
+    LOG(WARNING) << td::tag("rss_peak", td::format::as_size(mem_stat.resident_size_peak_));
+    LOG(WARNING) << td::tag("vm_peak", td::format::as_size(mem_stat.virtual_size_peak_));
+  }
+  LOG(WARNING) << td::tag("buffer_mem", td::format::as_size(td::BufferAllocator::get_buffer_mem()));
+  LOG(WARNING) << td::tag("buffer_slice_size", td::format::as_size(td::BufferAllocator::get_buffer_slice_size()));
+
+  const auto &shared_data = parameters_->shared_data_;
+  auto query_list_size = shared_data->query_list_size_.load(std::memory_order_relaxed);
+  auto query_count = shared_data->query_count_.load(std::memory_order_relaxed);
+  LOG(WARNING) << td::tag("pending queries", query_count) << td::tag("pending requests", query_list_size);
+
+  td::uint64 i = 0;
+  bool was_gap = false;
+  for (auto end = &shared_data->query_list_, cur = end->prev; cur != end; cur = cur->prev, i++) {
+    if (i < 20 || i > query_list_size - 20 || i % (query_list_size / 50 + 1) == 0) {
+      if (was_gap) {
+        LOG(WARNING) << "...";
+        was_gap = false;
+      }
+      LOG(WARNING) << static_cast<const Query &>(*cur);
+    } else {
+      was_gap = true;
+    }
+  }
+
+  td::dump_pending_network_queries(*parameters_->net_query_stats_);
+
+  auto now = td::Time::now();
+  auto top_clients = get_top_clients(10, {});
+  for (auto top_client_id : top_clients.top_client_ids) {
+    auto *client_info = clients_.get(top_client_id);
+    CHECK(client_info);
+
+    auto bot_info = client_info->client_.get_actor_unsafe()->get_bot_info();
+    td::string update_count;
+    td::string request_count;
+    auto replace_tabs = [](td::string &str) {
+      for (auto &c : str) {
+        if (c == '\t') {
+          c = ' ';
+        }
+      }
+    };
+    auto stats = client_info->stat_.as_vector(now);
+    for (auto &stat : stats) {
+      if (stat.key_ == "update_count") {
+        replace_tabs(stat.value_);
+        update_count = std::move(stat.value_);
+      }
+      if (stat.key_ == "request_count") {
+        replace_tabs(stat.value_);
+        request_count = std::move(stat.value_);
+      }
+    }
+    LOG(WARNING) << td::tag("id", bot_info.id_) << td::tag("update_count", update_count)
+                 << td::tag("request_count", request_count);
+  }
+}
+
 void ClientManager::raw_event(const td::Event::Raw &event) {
   auto id = get_link_token();
   auto *info = clients_.get(id);
@@ -409,6 +533,28 @@ void ClientManager::raw_event(const td::Event::Raw &event) {
     CHECK(value > 0);
     if (--value == 0) {
       active_client_count_.erase(info->tqueue_id_);
+    }
+  }
+}
+
+void ClientManager::timeout_expired() {
+  send_closure(watchdog_id_, &Watchdog::kick);
+  set_timeout_in(WATCHDOG_TIMEOUT / 2);
+
+  double now = td::Time::now();
+  if (now > next_tqueue_gc_time_) {
+    auto unix_time = parameters_->shared_data_->get_unix_time(now);
+    LOG(INFO) << "Run TQueue GC at " << unix_time;
+    td::int64 deleted_events;
+    bool is_finished;
+    std::tie(deleted_events, is_finished) = parameters_->shared_data_->tqueue_->run_gc(unix_time);
+    LOG(INFO) << "TQueue GC deleted " << deleted_events << " events";
+    next_tqueue_gc_time_ = td::Time::now() + (is_finished ? 60.0 : 1.0);
+
+    tqueue_deleted_events_ += deleted_events;
+    if (tqueue_deleted_events_ > last_tqueue_deleted_events_ + 10000) {
+      LOG(WARNING) << "TQueue GC already deleted " << tqueue_deleted_events_ << " events since the start";
+      last_tqueue_deleted_events_ = tqueue_deleted_events_;
     }
   }
 }
@@ -448,5 +594,7 @@ void ClientManager::finish_close() {
   }
   stop();
 }
+
+constexpr double ClientManager::WATCHDOG_TIMEOUT;
 
 }  // namespace telegram_bot_api

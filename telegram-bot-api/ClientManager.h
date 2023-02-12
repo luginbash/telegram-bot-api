@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2023
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -9,6 +9,7 @@
 #include "telegram-bot-api/Client.h"
 #include "telegram-bot-api/Query.h"
 #include "telegram-bot-api/Stats.h"
+#include "telegram-bot-api/Watchdog.h"
 
 #include "td/actor/actor.h"
 
@@ -41,6 +42,8 @@ class ClientManager final : public td::Actor {
       : parameters_(std::move(parameters)), token_range_(token_range) {
   }
 
+  void dump_statistics();
+
   void send(PromisedQueryPtr query);
 
   void get_stats(td::Promise<td::BufferSlice> promise, td::vector<std::pair<td::string, td::string>> args);
@@ -68,13 +71,27 @@ class ClientManager final : public td::Actor {
   bool close_flag_ = false;
   td::vector<td::Promise<td::Unit>> close_promises_;
 
+  td::ActorOwn<Watchdog> watchdog_id_;
+  double next_tqueue_gc_time_ = 0.0;
+  td::int64 tqueue_deleted_events_ = 0;
+  td::int64 last_tqueue_deleted_events_ = 0;
+
+  static constexpr double WATCHDOG_TIMEOUT = 0.25;
+
   static td::int64 get_tqueue_id(td::int64 user_id, bool is_test_dc);
 
   static PromisedQueryPtr get_webhook_restore_query(td::Slice token, td::Slice webhook_info,
                                                     std::shared_ptr<SharedData> shared_data);
 
+  struct TopClients {
+    td::int32 active_count = 0;
+    td::vector<td::uint64> top_client_ids;
+  };
+  TopClients get_top_clients(std::size_t max_count, td::Slice token_filter);
+
   void start_up() final;
   void raw_event(const td::Event::Raw &event) final;
+  void timeout_expired() final;
   void hangup_shared() final;
   void close_db();
   void finish_close();
