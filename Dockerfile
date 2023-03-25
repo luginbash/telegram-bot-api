@@ -1,9 +1,7 @@
 ARG GITHUB_WORKSPACE
-FROM debian:11-slim 
+FROM debian:bookworm-slim
 
-COPY ./bin/telegram-bot-api /usr/bin/telegram-bot-api
-
-RUN ldd  /usr/bin/telegram-bot-api
-
+COPY --chmod=0755 ./bin/telegram-bot-api /usr/bin/telegram-bot-api
+RUN apt update && apt install openssl -y && rm -rf /var/lib/apt/lists/*
 ENTRYPOINT ["/usr/bin/telegram-bot-api"]
 
