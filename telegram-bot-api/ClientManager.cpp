@@ -214,7 +214,7 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
 
   auto now = td::Time::now();
   auto top_clients = get_top_clients(50, id_filter);
-  sb << stat_.get_description() << '\n';
+  sb << BotStatActor::get_description() << '\n';
   if (id_filter.empty()) {
     sb << "uptime\t" << now - parameters_->start_time_ << '\n';
     sb << "bot_count\t" << clients_.size() << '\n';
@@ -230,7 +230,6 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
       LOG(INFO) << "Failed to get memory statistics: " << r_mem_stat.error();
     }
 
-    ServerCpuStat::update(td::Time::now());
     auto cpu_stats = ServerCpuStat::instance().as_vector(td::Time::now());
     for (auto &stat : cpu_stats) {
       sb << stat.key_ << "\t" << stat.value_ << '\n';
@@ -531,7 +530,7 @@ void ClientManager::raw_event(const td::Event::Raw &event) {
 
 void ClientManager::timeout_expired() {
   send_closure(watchdog_id_, &Watchdog::kick);
-  set_timeout_in(WATCHDOG_TIMEOUT / 2);
+  set_timeout_in(WATCHDOG_TIMEOUT / 10);
 
   double now = td::Time::now();
   if (now > next_tqueue_gc_time_) {
