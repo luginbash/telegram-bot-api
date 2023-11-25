@@ -331,7 +331,7 @@ class Client final : public WebhookActor::Callback {
 
   static bool to_bool(td::MutableSlice value);
 
-  static object_ptr<td_api::MessageReplyTo> get_message_reply_to(int64 reply_to_message_id);
+  static object_ptr<td_api::InputMessageReplyTo> get_input_message_reply_to(int64 reply_to_message_id);
 
   static td::Result<object_ptr<td_api::keyboardButton>> get_keyboard_button(td::JsonValue &button);
 
@@ -513,7 +513,7 @@ class Client final : public WebhookActor::Callback {
 
   static bool is_local_method(td::Slice method);
 
-  void on_cmd(PromisedQueryPtr query);
+  void on_cmd(PromisedQueryPtr query, bool force = false);
 
   td::Status process_get_me_query(PromisedQueryPtr &query);
   td::Status process_get_my_commands_query(PromisedQueryPtr &query);
@@ -746,7 +746,7 @@ class Client final : public WebhookActor::Callback {
   };
   static void add_group(GroupInfo *group_info, object_ptr<td_api::basicGroup> &&group);
   void set_group_photo(int64 group_id, object_ptr<td_api::chatPhoto> &&photo);
-  void set_group_description(int64 group_id, td::string &&descripton);
+  void set_group_description(int64 group_id, td::string &&description);
   void set_group_invite_link(int64 group_id, td::string &&invite_link);
   GroupInfo *add_group_info(int64 group_id);
   const GroupInfo *get_group_info(int64 group_id) const;
@@ -774,7 +774,7 @@ class Client final : public WebhookActor::Callback {
   };
   static void add_supergroup(SupergroupInfo *supergroup_info, object_ptr<td_api::supergroup> &&supergroup);
   void set_supergroup_photo(int64 supergroup_id, object_ptr<td_api::chatPhoto> &&photo);
-  void set_supergroup_description(int64 supergroup_id, td::string &&descripton);
+  void set_supergroup_description(int64 supergroup_id, td::string &&description);
   void set_supergroup_invite_link(int64 supergroup_id, td::string &&invite_link);
   void set_supergroup_sticker_set_id(int64 supergroup_id, int64 sticker_set_id);
   void set_supergroup_can_set_sticker_set(int64 supergroup_id, bool can_set_sticker_set);
@@ -825,7 +825,7 @@ class Client final : public WebhookActor::Callback {
     td::string initial_author_signature;
     td::string initial_sender_name;
     td::string author_signature;
-    int64 reply_to_message_id = 0;
+    object_ptr<td_api::messageReplyToMessage> reply_to_message;
     int64 media_album_id = 0;
     int64 via_bot_user_id = 0;
     object_ptr<td_api::MessageContent> content;
@@ -837,9 +837,15 @@ class Client final : public WebhookActor::Callback {
     mutable bool is_content_changed = false;
   };
 
-  static int64 get_reply_to_message_id(const object_ptr<td_api::message> &message);
+  static int64 get_same_chat_reply_to_message_id(const td_api::messageReplyToMessage *reply_to,
+                                                 int64 message_thread_id);
 
-  static void drop_reply_to_message_in_another_chat(object_ptr<td_api::message> &message);
+  static int64 get_same_chat_reply_to_message_id(const object_ptr<td_api::MessageReplyTo> &reply_to,
+                                                 int64 message_thread_id);
+
+  static int64 get_same_chat_reply_to_message_id(const object_ptr<td_api::message> &message);
+
+  static void drop_internal_reply_to_message_in_another_chat(object_ptr<td_api::message> &message);
 
   static td::Slice get_sticker_type(const object_ptr<td_api::StickerType> &type);
 

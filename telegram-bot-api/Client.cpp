@@ -532,7 +532,8 @@ class Client::JsonVectorEntities final : public td::Jsonable {
     for (auto &entity : entities_) {
       auto entity_type = entity->type_->get_id();
       if (entity_type != td_api::textEntityTypeBankCardNumber::ID &&
-          entity_type != td_api::textEntityTypeMediaTimestamp::ID) {
+          entity_type != td_api::textEntityTypeMediaTimestamp::ID &&
+          entity_type != td_api::textEntityTypeBlockQuote::ID) {
         array << JsonEntity(entity.get(), client_);
       }
     }
@@ -1762,12 +1763,20 @@ class Client::JsonWriteAccessAllowed final : public td::Jsonable {
   }
   void store(td::JsonValueScope *scope) const {
     auto object = scope->enter_object();
-    if (write_access_allowed_->web_app_ != nullptr) {
-      object("web_app_name", write_access_allowed_->web_app_->short_name_);
-    } else if (write_access_allowed_->by_request_) {
-      object("from_request", td::JsonTrue());
-    } else {
-      object("from_attachment_menu", td::JsonTrue());
+    switch (write_access_allowed_->reason_->get_id()) {
+      case td_api::botWriteAccessAllowReasonLaunchedWebApp::ID:
+        object("web_app_name", static_cast<const td_api::botWriteAccessAllowReasonLaunchedWebApp *>(
+                                   write_access_allowed_->reason_.get())
+                                   ->web_app_->short_name_);
+        break;
+      case td_api::botWriteAccessAllowReasonAcceptedRequest::ID:
+        object("from_request", td::JsonTrue());
+        break;
+      case td_api::botWriteAccessAllowReasonAddedToAttachmentMenu::ID:
+        object("from_attachment_menu", td::JsonTrue());
+        break;
+      default:
+        UNREACHABLE();
     }
   }
 
@@ -1973,14 +1982,22 @@ void Client::JsonMessage::store(td::JsonValueScope *scope) const {
     }
     object("forward_date", message_->initial_send_date);
   }
-  if (message_->reply_to_message_id > 0 && need_reply_) {
-    const MessageInfo *reply_to_message = client_->get_message(message_->chat_id, message_->reply_to_message_id, true);
-    if (reply_to_message != nullptr) {
-      object("reply_to_message", JsonMessage(reply_to_message, false, "reply in " + source_, client_));
-    } else {
-      LOG(INFO) << "Replied to unknown or deleted message " << message_->reply_to_message_id << " in chat "
-                << message_->chat_id << " while storing " << source_ << ' ' << message_->id;
+  if (need_reply_) {
+    auto reply_to_message_id =
+        get_same_chat_reply_to_message_id(message_->reply_to_message.get(), message_->message_thread_id);
+    if (reply_to_message_id > 0) {
+      // internal reply
+      const MessageInfo *reply_to_message = client_->get_message(message_->chat_id, reply_to_message_id, true);
+      if (reply_to_message != nullptr) {
+        object("reply_to_message", JsonMessage(reply_to_message, false, "reply in " + source_, client_));
+      } else {
+        LOG(INFO) << "Replied to unknown or deleted message " << reply_to_message_id << " in chat " << message_->chat_id
+                  << " while storing " << source_ << ' ' << message_->id;
+      }
     }
+  }
+  if (message_->reply_to_message != nullptr && message_->reply_to_message->origin_ != nullptr) {
+    // external reply
   }
   if (message_->media_album_id != 0) {
     object("media_group_id", td::to_string(message_->media_album_id));
@@ -2235,18 +2252,6 @@ void Client::JsonMessage::store(td::JsonValueScope *scope) const {
     case td_api::messageAnimatedEmoji::ID:
       UNREACHABLE();
       break;
-    case td_api::messageWebsiteConnected::ID: {
-      auto chat = client_->get_chat(message_->chat_id);
-      if (chat->type != ChatInfo::Type::Private) {
-        break;
-      }
-
-      auto content = static_cast<const td_api::messageWebsiteConnected *>(message_->content.get());
-      if (!content->domain_name_.empty()) {
-        object("connected_website", content->domain_name_);
-      }
-      break;
-    }
     case td_api::messagePassportDataSent::ID:
       break;
     case td_api::messagePassportDataReceived::ID: {
@@ -2293,8 +2298,20 @@ void Client::JsonMessage::store(td::JsonValueScope *scope) const {
     case td_api::messageSuggestProfilePhoto::ID:
       break;
     case td_api::messageBotWriteAccessAllowed::ID: {
+      auto chat = client_->get_chat(message_->chat_id);
+      if (chat->type != ChatInfo::Type::Private) {
+        break;
+      }
+
       auto content = static_cast<const td_api::messageBotWriteAccessAllowed *>(message_->content.get());
-      object("write_access_allowed", JsonWriteAccessAllowed(content));
+      if (content->reason_->get_id() == td_api::botWriteAccessAllowReasonConnectedWebsite::ID) {
+        auto reason = static_cast<const td_api::botWriteAccessAllowReasonConnectedWebsite *>(content->reason_.get());
+        if (!reason->domain_name_.empty()) {
+          object("connected_website", reason->domain_name_);
+        }
+      } else {
+        object("write_access_allowed", JsonWriteAccessAllowed(content));
+      }
       break;
     }
     case td_api::messageUserShared::ID: {
@@ -2308,6 +2325,12 @@ void Client::JsonMessage::store(td::JsonValueScope *scope) const {
       break;
     }
     case td_api::messageChatSetBackground::ID:
+      break;
+    case td_api::messagePremiumGiftCode::ID:
+      break;
+    case td_api::messagePremiumGiveawayCreated::ID:
+      break;
+    case td_api::messagePremiumGiveaway::ID:
       break;
     case td_api::messageStory::ID:
       object("story", JsonEmptyObject());
@@ -4408,15 +4431,17 @@ void Client::on_get_reply_message(int64 chat_id, object_ptr<td_api::message> rep
   CHECK(!queue.queue_.empty());
   object_ptr<td_api::message> &message = queue.queue_.front().message;
   CHECK(chat_id == message->chat_id_);
-  int64 reply_to_message_id = get_reply_to_message_id(message);
+  int64 reply_to_message_id = get_same_chat_reply_to_message_id(message);
   CHECK(reply_to_message_id > 0);
   if (reply_to_message == nullptr) {
     LOG(INFO) << "Can't find message " << reply_to_message_id << " in chat " << chat_id
               << ". It is already deleted or inaccessible because of the chosen privacy mode";
   } else {
-    CHECK(chat_id == reply_to_message->chat_id_);
-    CHECK(reply_to_message_id == reply_to_message->id_);
-    LOG(INFO) << "Receive reply to message " << reply_to_message_id << " in chat " << chat_id;
+    if (chat_id != reply_to_message->chat_id_ || reply_to_message_id != reply_to_message->id_) {
+      LOG(ERROR) << "Expect to get replied message " << reply_to_message_id << " in " << chat_id << ", but receive "
+                 << reply_to_message->id_ << " in " << reply_to_message->chat_id_;
+    }
+    LOG(INFO) << "Receive reply to message " << reply_to_message->id_ << " in chat " << reply_to_message->chat_id_;
     add_message(std::move(reply_to_message));
   }
 
@@ -4453,8 +4478,10 @@ void Client::on_get_callback_query_message(object_ptr<td_api::message> message, 
         process_new_callback_query_queue(user_id, state);
         return;
       }
-      LOG(INFO) << "Can't find callback query reply to message " << message_info->reply_to_message_id << " in chat "
-                << chat_id << ". It may be already deleted";
+      auto reply_to_message_id =
+          get_same_chat_reply_to_message_id(message_info->reply_to_message.get(), message_info->message_thread_id);
+      LOG(INFO) << "Can't find callback query reply to message " << reply_to_message_id << " in chat " << chat_id
+                << ". It may be already deleted";
     }
   } else {
     LOG(INFO) << "Receive callback query " << (state == 1 ? "reply to " : "") << "message " << message_id << " in chat "
@@ -5145,14 +5172,12 @@ void Client::on_update(object_ptr<td_api::Object> result) {
       auto update = move_object_as<td_api::updateNewChat>(result);
       auto chat = std::move(update->chat_);
       auto chat_info = add_chat(chat->id_);
-      bool need_warning = false;
       switch (chat->type_->get_id()) {
         case td_api::chatTypePrivate::ID: {
           auto type = move_object_as<td_api::chatTypePrivate>(chat->type_);
           chat_info->type = ChatInfo::Type::Private;
           auto user_id = type->user_id_;
           chat_info->user_id = user_id;
-          need_warning = get_user_info(user_id) == nullptr;
           break;
         }
         case td_api::chatTypeBasicGroup::ID: {
@@ -5160,7 +5185,6 @@ void Client::on_update(object_ptr<td_api::Object> result) {
           chat_info->type = ChatInfo::Type::Group;
           auto group_id = type->basic_group_id_;
           chat_info->group_id = group_id;
-          need_warning = get_group_info(group_id) == nullptr;
           break;
         }
         case td_api::chatTypeSupergroup::ID: {
@@ -5168,7 +5192,6 @@ void Client::on_update(object_ptr<td_api::Object> result) {
           chat_info->type = ChatInfo::Type::Supergroup;
           auto supergroup_id = type->supergroup_id_;
           chat_info->supergroup_id = supergroup_id;
-          need_warning = get_supergroup_info(supergroup_id) == nullptr;
           break;
         }
         case td_api::chatTypeSecret::ID:
@@ -5176,9 +5199,6 @@ void Client::on_update(object_ptr<td_api::Object> result) {
           break;
         default:
           UNREACHABLE();
-      }
-      if (need_warning) {
-        LOG(ERROR) << "Received updateNewChat about chat " << chat->id_ << ", but hadn't received corresponding info";
       }
 
       chat_info->title = std::move(chat->title_);
@@ -5520,9 +5540,9 @@ bool Client::to_bool(td::MutableSlice value) {
   return value == "true" || value == "yes" || value == "1";
 }
 
-td_api::object_ptr<td_api::MessageReplyTo> Client::get_message_reply_to(int64 reply_to_message_id) {
+td_api::object_ptr<td_api::InputMessageReplyTo> Client::get_input_message_reply_to(int64 reply_to_message_id) {
   if (reply_to_message_id > 0) {
-    return make_object<td_api::messageReplyToMessage>(0, reply_to_message_id);
+    return make_object<td_api::inputMessageReplyToMessage>(0, reply_to_message_id, nullptr);
   }
   return nullptr;
 }
@@ -6160,7 +6180,8 @@ td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_me
 
 td_api::object_ptr<td_api::messageSendOptions> Client::get_message_send_options(bool disable_notification,
                                                                                 bool protect_content) {
-  return make_object<td_api::messageSendOptions>(disable_notification, false, protect_content, false, nullptr, 0);
+  return make_object<td_api::messageSendOptions>(disable_notification, false, protect_content, false, nullptr, 0,
+                                                 false);
 }
 
 td::Result<td_api::object_ptr<td_api::inlineQueryResultsButton>> Client::get_inline_query_results_button(
@@ -7304,7 +7325,9 @@ td::Result<td_api::object_ptr<td_api::inputMessageText>> Client::get_input_messa
 
   TRY_RESULT(formatted_text, get_formatted_text(std::move(text), std::move(parse_mode), std::move(input_entities)));
 
-  return make_object<td_api::inputMessageText>(std::move(formatted_text), disable_web_page_preview, false);
+  return make_object<td_api::inputMessageText>(
+      std::move(formatted_text),
+      make_object<td_api::linkPreviewOptions>(disable_web_page_preview, td::string(), false, false, false), false);
 }
 
 td::Result<td_api::object_ptr<td_api::location>> Client::get_location(const Query *query) {
@@ -7815,7 +7838,7 @@ void Client::on_message_send_failed(int64 chat_id, int64 old_message_id, int64 n
   }
 }
 
-void Client::on_cmd(PromisedQueryPtr query) {
+void Client::on_cmd(PromisedQueryPtr query, bool force) {
   LOG(DEBUG) << "Process query " << *query;
   if (!td_client_.empty() && was_authorized_) {
     if (query->method() == "close") {
@@ -7842,6 +7865,42 @@ void Client::on_cmd(PromisedQueryPtr query) {
   auto method_it = methods_.find(query->method().str());
   if (method_it == methods_.end()) {
     return fail_query(404, "Not Found: method not found", std::move(query));
+  }
+
+  if (!query->files().empty() && !parameters_->local_mode_ && !force) {
+    auto file_size = query->files_size();
+    if (file_size > 100000) {
+      auto &last_send_message_time = last_send_message_time_[file_size];
+      auto now = td::Time::now();
+      auto min_delay = td::clamp(static_cast<double>(file_size) * 1e-7, 0.2, 0.9);
+      auto max_bucket_volume = 1.0;
+      if (last_send_message_time > now + 5.0) {
+        return fail_query_flood_limit_exceeded(std::move(query));
+      }
+
+      last_send_message_time = td::max(last_send_message_time + min_delay, now - max_bucket_volume);
+      LOG(DEBUG) << "Query with files of size " << file_size << " can be processed in " << last_send_message_time - now
+                 << " seconds";
+
+      td::create_actor<td::SleepActor>(
+          "DeleteLastSendMessageTimeSleepActor", last_send_message_time + min_delay - (now - max_bucket_volume),
+          td::PromiseCreator::lambda([actor_id = actor_id(this), file_size,
+                                      max_delay = max_bucket_volume + min_delay](td::Result<td::Unit>) mutable {
+            send_closure(actor_id, &Client::delete_last_send_message_time, file_size, max_delay);
+          }))
+          .release();
+
+      if (last_send_message_time > now) {
+        td::create_actor<td::SleepActor>(
+            "DoSendMessageSleepActor", last_send_message_time - now,
+            td::PromiseCreator::lambda(
+                [actor_id = actor_id(this), query = std::move(query)](td::Result<td::Unit>) mutable {
+                  send_closure(actor_id, &Client::on_cmd, std::move(query), true);
+                }))
+            .release();
+        return;
+      }
+    }
   }
 
   auto result = (this->*(method_it->second))(query);
@@ -8319,17 +8378,17 @@ td::Status Client::process_send_media_group_query(PromisedQueryPtr &query) {
             auto message_count = input_message_contents.size();
             count += static_cast<int32>(message_count);
 
-            send_request(make_object<td_api::sendMessageAlbum>(
-                             chat_id, message_thread_id, get_message_reply_to(reply_to_message_id),
-                             get_message_send_options(disable_notification, protect_content),
-                             std::move(input_message_contents), false),
-                         td::make_unique<TdOnSendMessageAlbumCallback>(this, chat_id, message_count, std::move(query)));
+            send_request(
+                make_object<td_api::sendMessageAlbum>(
+                    chat_id, message_thread_id, get_input_message_reply_to(reply_to_message_id),
+                    get_message_send_options(disable_notification, protect_content), std::move(input_message_contents)),
+                td::make_unique<TdOnSendMessageAlbumCallback>(this, chat_id, message_count, std::move(query)));
           };
           check_message_thread(chat_id, message_thread_id, reply_to_message_id, std::move(query),
                                std::move(on_message_thread_checked));
         };
         check_message(chat_id, reply_to_message_id, reply_to_message_id <= 0 || allow_sending_without_reply,
-                      AccessRights::Write, "replied message", std::move(query), std::move(on_success));
+                      AccessRights::Write, "message to reply", std::move(query), std::move(on_success));
       });
   return td::Status::OK();
 }
@@ -10027,51 +10086,6 @@ void Client::delete_last_send_message_time(td::int64 file_size, double max_delay
 
 void Client::do_send_message(object_ptr<td_api::InputMessageContent> input_message_content, PromisedQueryPtr query,
                              bool force) {
-  if (!parameters_->local_mode_) {
-    if (!force) {
-      auto file_size = query->files_size();
-      if (file_size > 100000) {
-        auto &last_send_message_time = last_send_message_time_[file_size];
-        auto now = td::Time::now();
-        auto min_delay = td::clamp(static_cast<double>(file_size) * 1e-7, 0.2, 0.9);
-        auto max_bucket_volume = 1.0;
-        if (last_send_message_time > now + 5.0) {
-          return fail_query_flood_limit_exceeded(std::move(query));
-        }
-
-        last_send_message_time = td::max(last_send_message_time + min_delay, now - max_bucket_volume);
-        LOG(DEBUG) << "Query with files of size " << file_size << " can be processed in "
-                   << last_send_message_time - now << " seconds";
-
-        td::create_actor<td::SleepActor>(
-            "DeleteLastSendMessageTimeSleepActor", last_send_message_time + min_delay - (now - max_bucket_volume),
-            td::PromiseCreator::lambda([actor_id = actor_id(this), file_size,
-                                        max_delay = max_bucket_volume + min_delay](td::Result<td::Unit>) mutable {
-              send_closure(actor_id, &Client::delete_last_send_message_time, file_size, max_delay);
-            }))
-            .release();
-
-        if (last_send_message_time > now) {
-          td::create_actor<td::SleepActor>(
-              "DoSendMessageSleepActor", last_send_message_time - now,
-              td::PromiseCreator::lambda([actor_id = actor_id(this),
-                                          input_message_content = std::move(input_message_content),
-                                          query = std::move(query)](td::Result<td::Unit>) mutable {
-                send_closure(actor_id, &Client::do_send_message, std::move(input_message_content), std::move(query),
-                             true);
-              }))
-              .release();
-          return;
-        }
-      }
-    } else {
-      if (logging_out_ || closing_) {
-        return fail_query_closing(std::move(query));
-      }
-      CHECK(was_authorized_);
-    }
-  }
-
   auto chat_id = query->arg("chat_id");
   auto message_thread_id = get_message_id(query.get(), "message_thread_id");
   auto reply_to_message_id = get_message_id(query.get(), "reply_to_message_id");
@@ -10104,7 +10118,7 @@ void Client::do_send_message(object_ptr<td_api::InputMessageContent> input_messa
                 count++;
 
                 send_request(make_object<td_api::sendMessage>(
-                                 chat_id, message_thread_id, get_message_reply_to(reply_to_message_id),
+                                 chat_id, message_thread_id, get_input_message_reply_to(reply_to_message_id),
                                  get_message_send_options(disable_notification, protect_content),
                                  std::move(reply_markup), std::move(input_message_content)),
                              td::make_unique<TdOnSendMessageCallback>(this, chat_id, std::move(query)));
@@ -10113,7 +10127,7 @@ void Client::do_send_message(object_ptr<td_api::InputMessageContent> input_messa
                                std::move(on_message_thread_checked));
         };
         check_message(chat_id, reply_to_message_id, reply_to_message_id <= 0 || allow_sending_without_reply,
-                      AccessRights::Write, "replied message", std::move(query), std::move(on_success));
+                      AccessRights::Write, "message to reply", std::move(query), std::move(on_success));
       });
 }
 
@@ -10448,8 +10462,8 @@ void Client::set_group_photo(int64 group_id, object_ptr<td_api::chatPhoto> &&pho
   add_group_info(group_id)->photo = std::move(photo);
 }
 
-void Client::set_group_description(int64 group_id, td::string &&descripton) {
-  add_group_info(group_id)->description = std::move(descripton);
+void Client::set_group_description(int64 group_id, td::string &&description) {
+  add_group_info(group_id)->description = std::move(description);
 }
 
 void Client::set_group_invite_link(int64 group_id, td::string &&invite_link) {
@@ -10477,8 +10491,8 @@ void Client::set_supergroup_photo(int64 supergroup_id, object_ptr<td_api::chatPh
   add_supergroup_info(supergroup_id)->photo = std::move(photo);
 }
 
-void Client::set_supergroup_description(int64 supergroup_id, td::string &&descripton) {
-  add_supergroup_info(supergroup_id)->description = std::move(descripton);
+void Client::set_supergroup_description(int64 supergroup_id, td::string &&description) {
+  add_supergroup_info(supergroup_id)->description = std::move(description);
 }
 
 void Client::set_supergroup_invite_link(int64 supergroup_id, td::string &&invite_link) {
@@ -10837,6 +10851,8 @@ void Client::add_update_impl(UpdateType update_type, const td::VirtuallyJsonable
   last_update_creation_time_ = td::Time::now();
 
   if (((allowed_update_types_ >> static_cast<int32>(update_type)) & 1) == 0) {
+    LOG(DEBUG) << "Skip unallowed update of the type " << static_cast<int32>(update_type) << ", allowed update mask is "
+               << allowed_update_types_;
     return;
   }
 
@@ -10949,7 +10965,10 @@ void Client::process_new_callback_query_queue(int64 user_id, int state) {
       state = 1;
     }
     if (state == 1) {
-      auto reply_to_message_id = message_info == nullptr ? 0 : message_info->reply_to_message_id;
+      auto reply_to_message_id = message_info == nullptr
+                                     ? 0
+                                     : get_same_chat_reply_to_message_id(message_info->reply_to_message.get(),
+                                                                         message_info->message_thread_id);
       if (reply_to_message_id > 0 && get_message(chat_id, reply_to_message_id, false) == nullptr) {
         queue.has_active_request_ = true;
         return send_request(make_object<td_api::getRepliedMessage>(chat_id, message_id),
@@ -10964,7 +10983,10 @@ void Client::process_new_callback_query_queue(int64 user_id, int state) {
         return send_request(make_object<td_api::getStickerSet>(message_sticker_set_id),
                             td::make_unique<TdOnGetStickerSetCallback>(this, message_sticker_set_id, user_id, 0));
       }
-      auto reply_to_message_id = message_info == nullptr ? 0 : message_info->reply_to_message_id;
+      auto reply_to_message_id = message_info == nullptr
+                                     ? 0
+                                     : get_same_chat_reply_to_message_id(message_info->reply_to_message.get(),
+                                                                         message_info->message_thread_id);
       if (reply_to_message_id > 0) {
         auto reply_to_message_info = get_message(chat_id, reply_to_message_id, true);
         auto reply_sticker_set_id =
@@ -11035,6 +11057,9 @@ void Client::add_update_chat_member(object_ptr<td_api::updateChatMember> &&updat
     auto webhook_queue_id = update->chat_id_ + (static_cast<int64>(is_my ? 5 : 6) << 33);
     auto update_type = is_my ? UpdateType::MyChatMember : UpdateType::ChatMember;
     add_update(update_type, JsonChatMemberUpdated(update.get(), this), left_time, webhook_queue_id);
+  } else {
+    LOG(DEBUG) << "Skip updateChatMember with date " << update->date_ << ", because current date is "
+               << get_unix_time();
   }
 }
 
@@ -11045,6 +11070,9 @@ void Client::add_update_chat_join_request(object_ptr<td_api::updateNewChatJoinRe
   if (left_time > 0) {
     auto webhook_queue_id = update->chat_id_ + (static_cast<int64>(6) << 33);
     add_update(UpdateType::ChatJoinRequest, JsonChatJoinRequest(update.get(), this), left_time, webhook_queue_id);
+  } else {
+    LOG(DEBUG) << "Skip updateNewChatJoinRequest with date " << update->request_->date_ << ", because current date is "
+               << get_unix_time();
   }
 }
 
@@ -11091,6 +11119,8 @@ bool Client::need_skip_update_message(int64 chat_id, const object_ptr<td_api::me
   int32 message_date = message->edit_date_ == 0 ? message->date_ : message->edit_date_;
   if (message_date <= get_unix_time() - 86400) {
     // don't send messages received/edited more than 1 day ago
+    LOG(DEBUG) << "Skip update about message with date " << message_date << ", because current date is "
+               << get_unix_time();
     return true;
   }
 
@@ -11121,8 +11151,7 @@ bool Client::need_skip_update_message(int64 chat_id, const object_ptr<td_api::me
     return true;
   }
 
-  if (message->forward_info_ != nullptr &&
-      message->forward_info_->origin_->get_id() == td_api::messageForwardOriginMessageImport::ID) {
+  if (message->import_info_ != nullptr) {
     return true;
   }
 
@@ -11188,6 +11217,12 @@ bool Client::need_skip_update_message(int64 chat_id, const object_ptr<td_api::me
       return true;
     case td_api::messageChatSetBackground::ID:
       return true;
+    case td_api::messagePremiumGiftCode::ID:
+      return true;
+    case td_api::messagePremiumGiveawayCreated::ID:
+      return true;
+    case td_api::messagePremiumGiveaway::ID:
+      return true;
     default:
       break;
   }
@@ -11202,19 +11237,22 @@ bool Client::need_skip_update_message(int64 chat_id, const object_ptr<td_api::me
   return false;
 }
 
-td::int64 Client::get_reply_to_message_id(const object_ptr<td_api::message> &message) {
-  if (message->content_->get_id() == td_api::messagePinMessage::ID) {
-    CHECK(message->reply_to_ == nullptr);
-    return static_cast<const td_api::messagePinMessage *>(message->content_.get())->message_id_;
+td::int64 Client::get_same_chat_reply_to_message_id(const td_api::messageReplyToMessage *reply_to,
+                                                    int64 message_thread_id) {
+  if (reply_to != nullptr && reply_to->origin_ == nullptr) {
+    CHECK(reply_to->message_id_ > 0);
+    return reply_to->message_id_;
   }
-  if (message->reply_to_ != nullptr) {
-    switch (message->reply_to_->get_id()) {
-      case td_api::messageReplyToMessage::ID: {
-        auto reply_to = static_cast<const td_api::messageReplyToMessage *>(message->reply_to_.get());
-        CHECK(reply_to->message_id_ > 0);
-        CHECK(reply_to->chat_id_ == message->chat_id_);
-        return reply_to->message_id_;
-      }
+  return message_thread_id;
+}
+
+td::int64 Client::get_same_chat_reply_to_message_id(const object_ptr<td_api::MessageReplyTo> &reply_to,
+                                                    int64 message_thread_id) {
+  if (reply_to != nullptr) {
+    switch (reply_to->get_id()) {
+      case td_api::messageReplyToMessage::ID:
+        return get_same_chat_reply_to_message_id(static_cast<const td_api::messageReplyToMessage *>(reply_to.get()),
+                                                 message_thread_id);
       case td_api::messageReplyToStory::ID:
         break;
       default:
@@ -11222,13 +11260,38 @@ td::int64 Client::get_reply_to_message_id(const object_ptr<td_api::message> &mes
         break;
     }
   }
-  return 0;
+  return message_thread_id;
 }
 
-void Client::drop_reply_to_message_in_another_chat(object_ptr<td_api::message> &message) {
+td::int64 Client::get_same_chat_reply_to_message_id(const object_ptr<td_api::message> &message) {
+  auto content_message_id = [&] {
+    switch (message->content_->get_id()) {
+      case td_api::messagePinMessage::ID:
+        return static_cast<const td_api::messagePinMessage *>(message->content_.get())->message_id_;
+      case td_api::messageGameScore::ID:
+        return static_cast<const td_api::messageGameScore *>(message->content_.get())->game_message_id_;
+      case td_api::messageChatSetBackground::ID:
+        return static_cast<const td_api::messageChatSetBackground *>(message->content_.get())
+            ->old_background_message_id_;
+      case td_api::messagePaymentSuccessful::ID:
+        UNREACHABLE();
+        return static_cast<int64>(0);
+      default:
+        return static_cast<int64>(0);
+    }
+  }();
+  if (content_message_id != 0) {
+    CHECK(message->reply_to_ == nullptr);
+    return content_message_id;
+  }
+  return get_same_chat_reply_to_message_id(message->reply_to_, message->message_thread_id_);
+}
+
+void Client::drop_internal_reply_to_message_in_another_chat(object_ptr<td_api::message> &message) {
   if (message->reply_to_ != nullptr && message->reply_to_->get_id() == td_api::messageReplyToMessage::ID) {
-    auto reply_in_chat_id = static_cast<td_api::messageReplyToMessage *>(message->reply_to_.get())->chat_id_;
-    if (reply_in_chat_id != message->chat_id_) {
+    auto *reply_to = static_cast<td_api::messageReplyToMessage *>(message->reply_to_.get());
+    auto reply_in_chat_id = reply_to->chat_id_;
+    if (reply_in_chat_id != message->chat_id_ && reply_to->origin_ == nullptr) {
       LOG(ERROR) << "Drop reply to message " << message->id_ << " in chat " << message->chat_id_
                  << " from another chat " << reply_in_chat_id;
       message->reply_to_ = nullptr;
@@ -11398,9 +11461,9 @@ void Client::process_new_message_queue(int64 chat_id, int state) {
     CHECK(chat_id == message_ref->chat_id_);
     int64 message_id = message_ref->id_;
 
-    drop_reply_to_message_in_another_chat(message_ref);
+    drop_internal_reply_to_message_in_another_chat(message_ref);
 
-    int64 reply_to_message_id = get_reply_to_message_id(message_ref);
+    int64 reply_to_message_id = get_same_chat_reply_to_message_id(message_ref);
     if (state == 0) {
       if (reply_to_message_id > 0 && get_message(chat_id, reply_to_message_id, false) == nullptr) {
         queue.has_active_request_ = true;
@@ -11553,36 +11616,32 @@ Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message,
   message_info->initial_message_id = 0;
   message_info->initial_author_signature = td::string();
   message_info->initial_sender_name = td::string();
+  message_info->is_automatic_forward = false;
   if (message->forward_info_ != nullptr) {
     message_info->initial_send_date = message->forward_info_->date_;
     auto origin = std::move(message->forward_info_->origin_);
     switch (origin->get_id()) {
-      case td_api::messageForwardOriginUser::ID: {
-        auto forward_info = move_object_as<td_api::messageForwardOriginUser>(origin);
+      case td_api::messageOriginUser::ID: {
+        auto forward_info = move_object_as<td_api::messageOriginUser>(origin);
         message_info->initial_sender_user_id = forward_info->sender_user_id_;
         break;
       }
-      case td_api::messageForwardOriginChat::ID: {
-        auto forward_info = move_object_as<td_api::messageForwardOriginChat>(origin);
+      case td_api::messageOriginChat::ID: {
+        auto forward_info = move_object_as<td_api::messageOriginChat>(origin);
         message_info->initial_sender_chat_id = forward_info->sender_chat_id_;
         message_info->initial_author_signature = std::move(forward_info->author_signature_);
         break;
       }
-      case td_api::messageForwardOriginHiddenUser::ID: {
-        auto forward_info = move_object_as<td_api::messageForwardOriginHiddenUser>(origin);
+      case td_api::messageOriginHiddenUser::ID: {
+        auto forward_info = move_object_as<td_api::messageOriginHiddenUser>(origin);
         message_info->initial_sender_name = std::move(forward_info->sender_name_);
         break;
       }
-      case td_api::messageForwardOriginChannel::ID: {
-        auto forward_info = move_object_as<td_api::messageForwardOriginChannel>(origin);
+      case td_api::messageOriginChannel::ID: {
+        auto forward_info = move_object_as<td_api::messageOriginChannel>(origin);
         message_info->initial_chat_id = forward_info->chat_id_;
         message_info->initial_message_id = forward_info->message_id_;
         message_info->initial_author_signature = std::move(forward_info->author_signature_);
-        break;
-      }
-      case td_api::messageForwardOriginMessageImport::ID: {
-        auto forward_info = move_object_as<td_api::messageForwardOriginMessageImport>(origin);
-        message_info->initial_sender_name = std::move(forward_info->sender_name_);
         break;
       }
       default:
@@ -11592,6 +11651,9 @@ Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message,
     message_info->is_automatic_forward =
         from_chat_id != 0 && from_chat_id != chat_id && message->forward_info_->from_message_id_ != 0 &&
         get_chat_type(chat_id) == ChatType::Supergroup && get_chat_type(from_chat_id) == ChatType::Channel;
+  } else if (message->import_info_ != nullptr) {
+    message_info->initial_send_date = message->import_info_->date_;
+    message_info->initial_sender_name = std::move(message->import_info_->sender_name_);
   }
 
   CHECK(message->sender_id_ != nullptr);
@@ -11627,13 +11689,12 @@ Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message,
   message_info->is_topic_message = message->is_topic_message_;
   message_info->author_signature = std::move(message->author_signature_);
 
-  drop_reply_to_message_in_another_chat(message);
+  drop_internal_reply_to_message_in_another_chat(message);
 
   if (message->reply_to_ != nullptr && message->reply_to_->get_id() == td_api::messageReplyToMessage::ID) {
-    message_info->reply_to_message_id =
-        static_cast<td_api::messageReplyToMessage *>(message->reply_to_.get())->message_id_;
+    message_info->reply_to_message = move_object_as<td_api::messageReplyToMessage>(message->reply_to_);
   } else {
-    message_info->reply_to_message_id = 0;
+    message_info->reply_to_message = nullptr;
   }
 
   if (message_info->content == nullptr || force_update_content) {
