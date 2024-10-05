@@ -148,6 +148,7 @@ class Client final : public WebhookActor::Callback {
   class JsonInlineCallbackQuery;
   class JsonShippingQuery;
   class JsonPreCheckoutQuery;
+  class JsonPaidMediaPurchased;
   class JsonBotCommand;
   class JsonBotMenuButton;
   class JsonBotName;
@@ -194,6 +195,7 @@ class Client final : public WebhookActor::Callback {
   class JsonSharedUser;
   class JsonUsersShared;
   class JsonChatShared;
+  class JsonGiveawayCreated;
   class JsonGiveaway;
   class JsonGiveawayWinners;
   class JsonGiveawayCompleted;
@@ -266,9 +268,11 @@ class Client final : public WebhookActor::Callback {
 
   void on_get_sticker_set(int64 set_id, int64 new_callback_query_user_id, int64 new_message_chat_id,
                           const td::string &new_message_business_connection_id,
-                          int64 new_business_callback_query_user_id, object_ptr<td_api::stickerSet> sticker_set);
+                          int64 new_business_callback_query_user_id, object_ptr<td_api::text> sticker_set_name);
 
   void on_get_sticker_set_name(int64 set_id, const td::string &name);
+
+  void on_get_sticker_set_name(int64 set_id, object_ptr<td_api::Object> sticker_set_name);
 
   class TdQueryCallback {
    public:
@@ -810,6 +814,8 @@ class Client final : public WebhookActor::Callback {
   static void fail_query_with_error(PromisedQueryPtr &&query, object_ptr<td_api::error> error,
                                     td::Slice default_message = td::Slice());
 
+  static bool is_special_error_code(int32 error_code);
+
   class JsonUpdates;
   void do_get_updates(int32 offset, int32 limit, int32 timeout, PromisedQueryPtr query);
 
@@ -1103,6 +1109,8 @@ class Client final : public WebhookActor::Callback {
 
   void add_new_pre_checkout_query(object_ptr<td_api::updateNewPreCheckoutQuery> &&query);
 
+  void add_update_purchased_paid_media(object_ptr<td_api::updatePaidMediaPurchased> &&query);
+
   void add_new_custom_event(object_ptr<td_api::updateNewCustomEvent> &&event);
 
   void add_new_custom_query(object_ptr<td_api::updateNewCustomQuery> &&query);
@@ -1147,6 +1155,7 @@ class Client final : public WebhookActor::Callback {
     BusinessMessage,
     EditedBusinessMessage,
     BusinessMessagesDeleted,
+    PurchasedPaidMedia,
     Size
   };
 
