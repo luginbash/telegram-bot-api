@@ -35,7 +35,7 @@ jobs:
           buildDirectory: '${{ github.workspace }}/build'
           
     - name: Upload a Build Artifact
-      uses: actions/upload-artifact@v4.4.3
+      uses: actions/upload-artifact@v4.6.0
       with:
         name: telegram-bot-api
         path: ${{ github.workspace }}/build/telegram-bot-api
