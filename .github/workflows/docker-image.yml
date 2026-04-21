@@ -25,7 +25,7 @@ jobs:
     
     - name: Build
       # Build your program with the given configuration
-      uses: lukka/run-cmake@v3
+      uses: lukka/run-cmake@v3.4
       with:
           cmakeListsOrSettingsJson: CMakeListsTxtAdvanced
           cmakeListsTxtPath: '${{ github.workspace }}/CMakeLists.txt'
